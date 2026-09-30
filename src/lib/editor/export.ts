@@ -14,6 +14,8 @@ export interface ExportSettings {
 	resolution: string;
 	/** "high" | "medium" | "low". */
 	quality: string;
+	/** H.264 backend: "cpu" (libx264) or "nvenc" (NVIDIA NVENC). */
+	encoder: 'cpu' | 'nvenc';
 }
 
 /** File extension for an output format. */

@@ -30,19 +30,30 @@
 		{ value: 'medium', label: 'Medium' },
 		{ value: 'low', label: 'Low' }
 	];
+	const encoders: { value: ExportSettings['encoder']; label: string }[] = [
+		{ value: 'cpu', label: 'CPU · libx264' },
+		{ value: 'nvenc', label: 'NVIDIA NVENC' }
+	];
 
 	let format = $state('mp4-h264');
 	let resolution = $state('source');
 	let quality = $state('high');
+	let encoder = $state<ExportSettings['encoder']>('cpu');
 
 	const isGif = $derived(format === 'gif');
+	const supportsEncoderChoice = $derived(format === 'mp4-h264');
 
 	function close() {
 		editor.exportDialogOpen = false;
 	}
 
 	function start() {
-		const settings: ExportSettings = { format, resolution, quality };
+		const settings: ExportSettings = {
+			format,
+			resolution,
+			quality,
+			encoder: supportsEncoderChoice ? encoder : 'cpu'
+		};
 		close();
 		runExport(settings);
 	}
@@ -94,6 +105,25 @@
 					{/each}
 				</div>
 			</section>
+
+			{#if supportsEncoderChoice}
+				<section class="group">
+					<h3 class="label">Encoder</h3>
+					<div class="segmented" role="radiogroup" aria-label="H.264 encoder">
+						{#each encoders as option (option.value)}
+							<button
+								class="seg"
+								class:active={encoder === option.value}
+								role="radio"
+								aria-checked={encoder === option.value}
+								onclick={() => (encoder = option.value)}
+							>
+								{option.label}
+							</button>
+						{/each}
+					</div>
+				</section>
+			{/if}
 
 			<section class="group">
 				<h3 class="label">Resolution</h3>

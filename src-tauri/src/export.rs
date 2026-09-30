@@ -71,6 +71,13 @@ pub struct ExportSettings {
 	resolution: String,
 	/// "high" | "medium" | "low".
 	quality: String,
+	/// H.264 backend: "cpu" (libx264) or "nvenc" (NVIDIA NVENC).
+	#[serde(default = "default_encoder")]
+	encoder: String,
+}
+
+fn default_encoder() -> String {
+	"cpu".into()
 }
 
 /// Frames per second for GIF output.
@@ -143,6 +150,66 @@ fn crf(codec: &str, quality: &str) -> &'static str {
 		(_, "medium") => "23",
 		(_, "low") => "28",
 		_ => "18", // x264 high / default
+	}
+}
+
+/// Constant-quality target for NVENC VBR (lower = better quality).
+fn nvenc_cq(quality: &str) -> &'static str {
+	match quality {
+		"medium" => "23",
+		"low" => "28",
+		_ => "19",
+	}
+}
+
+/// Validate the deliberately narrow M1 encoder contract. Other formats retain
+/// their existing software encoders until a later milestone explicitly expands it.
+fn validate_encoder(format: &str, encoder: &str) -> Result<(), String> {
+	match (format, encoder) {
+		(_, "cpu") | ("mp4-h264", "nvenc") => Ok(()),
+		(_, "nvenc") => Err("NVIDIA NVENC is only available for MP4 H.264 export.".into()),
+		(_, other) => Err(format!("Unsupported H.264 encoder: {other}")),
+	}
+}
+
+fn validate_export_settings(settings: &ExportSettings) -> Result<(), String> {
+	match settings.format.as_str() {
+		"mp4-h264" | "mp4-h265" | "webm-vp9" | "mov-h264" | "gif" => {}
+		other => return Err(format!("Unsupported export format: {other}")),
+	}
+	validate_encoder(&settings.format, &settings.encoder)
+}
+
+/// Backend-specific H.264 flags. Keep x264-only CRF/preset flags out of NVENC.
+fn h264_video_args(encoder: &str, quality: &str) -> Result<Vec<String>, String> {
+	match encoder {
+		"cpu" => Ok(vec![
+			"-c:v".into(),
+			"libx264".into(),
+			"-preset".into(),
+			"veryfast".into(),
+			"-crf".into(),
+			crf("x264", quality).into(),
+			"-pix_fmt".into(),
+			"yuv420p".into(),
+		]),
+		"nvenc" => Ok(vec![
+			"-c:v".into(),
+			"h264_nvenc".into(),
+			"-preset".into(),
+			"p5".into(),
+			"-tune".into(),
+			"hq".into(),
+			"-rc".into(),
+			"vbr".into(),
+			"-cq".into(),
+			nvenc_cq(quality).into(),
+			"-b:v".into(),
+			"0".into(),
+			"-pix_fmt".into(),
+			"yuv420p".into(),
+		]),
+		other => Err(format!("Unsupported H.264 encoder: {other}")),
 	}
 }
 
@@ -344,7 +411,7 @@ fn build_args(
 	text_assets: &[Option<TextAsset>],
 	fps: f64,
 	output: &str,
-) -> (Vec<String>, f64) {
+) -> Result<(Vec<String>, f64), String> {
 	let total: f64 = clips.iter().map(|c| c.timeline_end()).fold(0.0, f64::max);
 	// Project frame rate (fastest clip); slower clips are frame-held to it.
 	let fps = if (1.0..=240.0).contains(&fps) { fps } else { 30.0 };
@@ -534,18 +601,24 @@ fn build_args(
 			crf("x264", q), "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags",
 			"+faststart",
 		],
-		_ => vec![
-			// mp4-h264 (default)
-			"-map", "[outv]", "-map", "[outa]", "-c:v", "libx264", "-preset", "veryfast", "-crf",
-			crf("x264", q), "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags",
-			"+faststart",
-		],
+		"mp4-h264" => Vec::new(),
+		_ => return Err(format!("Unsupported export format: {}", settings.format)),
 	};
-	args.extend(tail.iter().map(|s| s.to_string()));
+	if settings.format == "mp4-h264" {
+		args.extend(["-map", "[outv]", "-map", "[outa]"].iter().map(|s| s.to_string()));
+		args.extend(h264_video_args(&settings.encoder, q)?);
+		args.extend(
+			["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+				.iter()
+				.map(|s| s.to_string()),
+		);
+	} else {
+		args.extend(tail.iter().map(|s| s.to_string()));
+	}
 	// Machine-readable progress on stdout.
 	args.extend(["-progress", "pipe:1", "-nostats"].iter().map(|s| s.to_string()));
 	args.push(output.to_string());
-	(args, total)
+	Ok((args, total))
 }
 
 /// Probe a single stream's codec name (e.g. "h264", "aac"); None if absent.
@@ -653,6 +726,7 @@ pub async fn export_video(
 	if clips.is_empty() {
 		return Err("Nothing to export: the timeline is empty.".into());
 	}
+	validate_export_settings(&settings)?;
 
 	// Lossless stream-copy fastpath (single trimmed clip, compatible codecs).
 	if let Some(c) = copy_candidate(&clips, &aspect, &settings) {
@@ -734,13 +808,59 @@ pub async fn export_video(
 		&text_assets,
 		fps,
 		&output,
-	);
+	)?;
 
 	let result = run_ffmpeg(app, args, total).await;
 	for p in &text_tempfiles {
 		let _ = std::fs::remove_file(p);
 	}
 	result
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{h264_video_args, nvenc_cq, validate_encoder, validate_export_settings, ExportSettings};
+
+	#[test]
+	fn nvenc_quality_mapping_is_distinct() {
+		assert_eq!(nvenc_cq("high"), "19");
+		assert_eq!(nvenc_cq("medium"), "23");
+		assert_eq!(nvenc_cq("low"), "28");
+	}
+
+	#[test]
+	fn h264_backends_do_not_share_codec_specific_flags() {
+		let cpu = h264_video_args("cpu", "high").unwrap();
+		let nvenc = h264_video_args("nvenc", "high").unwrap();
+
+		assert!(cpu.iter().any(|arg| arg == "libx264"));
+		assert!(cpu.iter().any(|arg| arg == "-crf"));
+		assert!(!cpu.iter().any(|arg| arg == "h264_nvenc"));
+
+		assert!(nvenc.iter().any(|arg| arg == "h264_nvenc"));
+		assert!(nvenc.iter().any(|arg| arg == "-cq"));
+		assert!(!nvenc.iter().any(|arg| arg == "-crf"));
+		assert!(!nvenc.iter().any(|arg| arg == "veryfast"));
+	}
+
+	#[test]
+	fn nvenc_is_scoped_to_mp4_h264() {
+		assert!(validate_encoder("mp4-h264", "nvenc").is_ok());
+		assert!(validate_encoder("mp4-h264", "cpu").is_ok());
+		assert!(validate_encoder("mov-h264", "nvenc").is_err());
+		assert!(validate_encoder("mp4-h264", "unknown").is_err());
+	}
+
+	#[test]
+	fn unknown_export_formats_fail_before_ffmpeg_runs() {
+		let settings = ExportSettings {
+			format: "unknown".into(),
+			resolution: "source".into(),
+			quality: "high".into(),
+			encoder: "cpu".into(),
+		};
+		assert!(validate_export_settings(&settings).is_err());
+	}
 }
 
 /// Spawn the bundled ffmpeg sidecar with the given args and stream progress.

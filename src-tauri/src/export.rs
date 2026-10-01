@@ -7,9 +7,23 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(windows)]
+use std::{
+	ffi::OsStr,
+	os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
+};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
+#[cfg(windows)]
+use windows_sys::Win32::{
+	Foundation::GENERIC_READ,
+	Storage::FileSystem::{
+		FileDispositionInfo, FileIdInfo, FileRenameInfo, GetFileInformationByHandleEx,
+		SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
+		FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
+	},
+};
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -234,12 +248,128 @@ fn reject_source_destination(destination: &Path, sources: &[&Path]) -> Result<()
 	Ok(())
 }
 
-/// Only paths successfully reserved with create_new belong to this invocation.
-/// Never truncate a collision or delete a path merely because its name matches.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowsFileIdentity {
+	volume: u64,
+	file_id: [u8; 16],
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &std::fs::File) -> std::io::Result<WindowsFileIdentity> {
+	let mut info = FILE_ID_INFO::default();
+	let ok = unsafe {
+		GetFileInformationByHandleEx(
+			file.as_raw_handle(),
+			FileIdInfo,
+			std::ptr::from_mut(&mut info).cast(),
+			std::mem::size_of::<FILE_ID_INFO>() as u32,
+		)
+	};
+	if ok == 0 {
+		Err(std::io::Error::last_os_error())
+	} else {
+		Ok(WindowsFileIdentity {
+			volume: info.VolumeSerialNumber,
+			file_id: info.FileId.Identifier,
+		})
+	}
+}
+
+#[cfg(windows)]
+fn reserve_windows_stage(path: &Path) -> std::io::Result<(std::fs::File, WindowsFileIdentity)> {
+	let file = std::fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create_new(true)
+		.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+		.open(path)?;
+	let identity = windows_file_identity(&file)?;
+	Ok((file, identity))
+}
+
+#[cfg(windows)]
+fn open_owned_windows_stage(
+	path: &Path,
+	expected: WindowsFileIdentity,
+) -> std::io::Result<std::fs::File> {
+	let file = std::fs::OpenOptions::new()
+		.read(true)
+		.access_mode(GENERIC_READ | DELETE)
+		.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+		.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+		.open(path)?;
+	if windows_file_identity(&file)? != expected {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::PermissionDenied,
+			"stage object identity changed",
+		));
+	}
+	Ok(file)
+}
+
+#[cfg(windows)]
+fn rename_windows_file(file: &std::fs::File, destination: &Path) -> std::io::Result<()> {
+	let name: Vec<u16> = OsStr::new(destination).encode_wide().collect();
+	let name_bytes = name
+		.len()
+		.checked_mul(std::mem::size_of::<u16>())
+		.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+	let buffer_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+		.checked_add(name_bytes)
+		.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+	let word = std::mem::size_of::<usize>();
+	let mut buffer = vec![0_usize; buffer_bytes.div_ceil(word)];
+	let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+	unsafe {
+		(*info).Anonymous.ReplaceIfExists = true;
+		(*info).RootDirectory = std::ptr::null_mut();
+		(*info).FileNameLength = name_bytes
+			.try_into()
+			.map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+		std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+		if SetFileInformationByHandle(
+			file.as_raw_handle(),
+			FileRenameInfo,
+			info.cast(),
+			buffer_bytes as u32,
+		) == 0
+		{
+			return Err(std::io::Error::last_os_error());
+		}
+	}
+	Ok(())
+}
+
+#[cfg(windows)]
+fn delete_windows_file(file: &std::fs::File) -> std::io::Result<()> {
+	let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+	let ok = unsafe {
+		SetFileInformationByHandle(
+			file.as_raw_handle(),
+			FileDispositionInfo,
+			std::ptr::from_ref(&disposition).cast(),
+			std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+		)
+	};
+	if ok == 0 {
+		Err(std::io::Error::last_os_error())
+	} else {
+		Ok(())
+	}
+}
+
+/// Only objects successfully reserved with create_new belong to this invocation.
+/// Windows keeps the reserved object open while FFmpeg and ffprobe use its path,
+/// then compares FILE_ID_INFO before handle-relative publication or cleanup.
 struct ExportFiles {
 	destination: PathBuf,
 	stage: PathBuf,
 	stage_owned: bool,
+	#[cfg(windows)]
+	stage_guard: Option<std::fs::File>,
+	#[cfg(windows)]
+	stage_identity: WindowsFileIdentity,
 	text: Vec<PathBuf>,
 }
 
@@ -259,6 +389,10 @@ impl ExportFiles {
 			".katana-stage-{token}.{}",
 			output_extension(format)
 		));
+		#[cfg(windows)]
+		let (stage_guard, stage_identity) =
+			reserve_windows_stage(&stage).map_err(|_| ExportError::OutputPreparation)?;
+		#[cfg(not(windows))]
 		std::fs::OpenOptions::new()
 			.write(true)
 			.create_new(true)
@@ -268,6 +402,10 @@ impl ExportFiles {
 			destination,
 			stage,
 			stage_owned: true,
+			#[cfg(windows)]
+			stage_guard: Some(stage_guard),
+			#[cfg(windows)]
+			stage_identity,
 			text: Vec::new(),
 		})
 	}
@@ -291,12 +429,46 @@ impl ExportFiles {
 	}
 
 	fn validate_file(&self) -> Result<(), ExportError> {
-		let metadata =
-			std::fs::symlink_metadata(&self.stage).map_err(|_| ExportError::OutputValidation)?;
-		if metadata.file_type().is_file() && metadata.len() > 0 {
-			Ok(())
-		} else {
-			Err(ExportError::OutputValidation)
+		#[cfg(windows)]
+		{
+			let guard = self
+				.stage_guard
+				.as_ref()
+				.ok_or(ExportError::OutputValidation)?;
+			if windows_file_identity(guard).map_err(|_| ExportError::OutputValidation)?
+				!= self.stage_identity
+			{
+				return Err(ExportError::OutputValidation);
+			}
+			let path_file = std::fs::OpenOptions::new()
+				.read(true)
+				.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+				.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+				.open(&self.stage)
+				.map_err(|_| ExportError::OutputValidation)?;
+			if windows_file_identity(&path_file).map_err(|_| ExportError::OutputValidation)?
+				!= self.stage_identity
+			{
+				return Err(ExportError::OutputValidation);
+			}
+			let metadata = guard
+				.metadata()
+				.map_err(|_| ExportError::OutputValidation)?;
+			if metadata.is_file() && metadata.len() > 0 {
+				Ok(())
+			} else {
+				Err(ExportError::OutputValidation)
+			}
+		}
+		#[cfg(not(windows))]
+		{
+			let metadata = std::fs::symlink_metadata(&self.stage)
+				.map_err(|_| ExportError::OutputValidation)?;
+			if metadata.file_type().is_file() && metadata.len() > 0 {
+				Ok(())
+			} else {
+				Err(ExportError::OutputValidation)
+			}
 		}
 	}
 
@@ -307,6 +479,17 @@ impl ExportFiles {
 				Err(e) => e.kind() == std::io::ErrorKind::NotFound,
 			}
 		}
+		#[cfg(windows)]
+		if self.stage_owned {
+			drop(self.stage_guard.take());
+			if open_owned_windows_stage(&self.stage, self.stage_identity)
+				.and_then(|file| delete_windows_file(&file))
+				.is_ok()
+			{
+				self.stage_owned = false;
+			}
+		}
+		#[cfg(not(windows))]
 		if self.stage_owned && remove(&self.stage) {
 			self.stage_owned = false;
 		}
@@ -314,19 +497,36 @@ impl ExportFiles {
 		self.stage_owned || !self.text.is_empty()
 	}
 
+	fn publish_stage(&mut self) -> std::io::Result<()> {
+		#[cfg(windows)]
+		{
+			drop(self.stage_guard.take());
+			let file = open_owned_windows_stage(&self.stage, self.stage_identity)?;
+			rename_windows_file(&file, &self.destination)?;
+			self.stage_owned = false;
+			Ok(())
+		}
+		#[cfg(not(windows))]
+		{
+			std::fs::rename(&self.stage, &self.destination)?;
+			self.stage_owned = false;
+			Ok(())
+		}
+	}
+
 	/// One rename boundary; never delete destination or use copy-overwrite.
 	/// Native Windows/locking/network filesystem behavior must be qualified.
 	fn finish(
-		&self,
+		&mut self,
 		process: Result<(), ExportError>,
 		validate: impl FnOnce() -> Result<(), ExportError>,
-		publish: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+		publish: impl FnOnce(&mut Self) -> std::io::Result<()>,
 		complete: impl FnOnce(),
 	) -> Result<(), ExportError> {
 		process?;
 		self.validate_file()?;
 		validate()?;
-		publish(&self.stage, &self.destination).map_err(|_| ExportError::Publication)?;
+		publish(self).map_err(|_| ExportError::Publication)?;
 		complete();
 		Ok(())
 	}
@@ -417,9 +617,16 @@ impl MediaExpectation {
 			.ok_or(ExportError::OutputValidation)?;
 		let w = video.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
 		let h = video.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+		let packets = video
+			.get("nb_read_packets")
+			.and_then(|v| {
+				v.as_u64()
+					.or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+			})
+			.unwrap_or(0);
 		if w == 0
-			|| h == 0 || video.get("codec_name").and_then(|v| v.as_str())
-			!= Some(self.video.as_str())
+			|| h == 0 || packets == 0
+			|| video.get("codec_name").and_then(|v| v.as_str()) != Some(self.video.as_str())
 		{
 			return Err(ExportError::OutputValidation);
 		}
@@ -1116,7 +1323,7 @@ pub async fn export_video(
 				let expected =
 					MediaExpectation::copied(&settings.format, dims, vc, acodec.as_deref());
 				let (args, total) = build_copy_args(c, &settings.format, &stage);
-				let result = run_export(&app, &files, args, total, &expected).await;
+				let result = run_export(&app, &mut files, args, total, &expected).await;
 				return finish_cleanup(&mut files, result);
 			}
 		}
@@ -1191,7 +1398,7 @@ pub async fn export_video(
 		Err(_) => return finish_cleanup(&mut files, Err(ExportError::InvalidRequest)),
 	};
 	let expected = MediaExpectation::composite(&settings, &aspect, base_dims);
-	let result = run_export(&app, &files, args, total, &expected).await;
+	let result = run_export(&app, &mut files, args, total, &expected).await;
 	finish_cleanup(&mut files, result)
 }
 
@@ -1265,7 +1472,7 @@ mod tests {
 
 	fn media(video: &str, audio: Option<&str>, container: &str, w: u32, h: u32) -> Vec<u8> {
 		let mut streams = vec![
-			serde_json::json!({"codec_type":"video", "codec_name":video, "width":w, "height":h}),
+			serde_json::json!({"codec_type":"video", "codec_name":video, "width":w, "height":h, "nb_read_packets":"1"}),
 		];
 		if let Some(audio) = audio {
 			streams.push(serde_json::json!({"codec_type":"audio", "codec_name":audio}));
@@ -1396,7 +1603,7 @@ mod tests {
 			"NVENC unavailable",
 		] {
 			let fixture = Fixture::new();
-			let files = fixture.files();
+			let mut files = fixture.files();
 			let calls = std::cell::Cell::new(0);
 			let process = tauri::async_runtime::block_on(encode_once(|| async {
 				calls.set(calls.get() + 1);
@@ -1406,7 +1613,7 @@ mod tests {
 			let result = files.finish(
 				process,
 				|| panic!("validation after failed process"),
-				|_, _| panic!("publication after failed process"),
+				|_| panic!("publication after failed process"),
 				|| panic!("completion after failure"),
 			);
 			assert_eq!(result, Err(ExportError::Process));
@@ -1417,12 +1624,12 @@ mod tests {
 	#[test]
 	fn validation_failure_preserves_destination_and_never_completes() {
 		let fixture = Fixture::new();
-		let files = fixture.files();
+		let mut files = fixture.files();
 		assert_eq!(
 			files.finish(
 				Ok(()),
 				|| Err(ExportError::OutputValidation),
-				|_, _| panic!("publication before validation"),
+				|_| panic!("publication before validation"),
 				|| panic!("completed failed validation")
 			),
 			Err(ExportError::OutputValidation)
@@ -1433,12 +1640,12 @@ mod tests {
 	#[test]
 	fn publication_failure_preserves_destination_and_never_completes() {
 		let fixture = Fixture::new();
-		let files = fixture.files();
+		let mut files = fixture.files();
 		assert_eq!(
 			files.finish(
 				Ok(()),
 				|| Ok(()),
-				|_, _| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+				|_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
 				|| panic!("completed failed publication")
 			),
 			Err(ExportError::Publication)
@@ -1449,17 +1656,19 @@ mod tests {
 	#[test]
 	fn exit_zero_missing_empty_or_nonregular_stage_is_not_success() {
 		let fixture = Fixture::new();
-		let files = fixture.files();
+		let mut files = fixture.files();
 		std::fs::write(&files.stage, b"").unwrap();
 		assert_eq!(
 			files.finish(
 				Ok(()),
 				|| panic!("validate empty file"),
-				|_, _| panic!("publish empty"),
+				|_| panic!("publish empty"),
 				|| panic!()
 			),
 			Err(ExportError::OutputValidation)
 		);
+		#[cfg(windows)]
+		drop(files.stage_guard.take());
 		std::fs::remove_file(&files.stage).unwrap();
 		assert_eq!(files.validate_file(), Err(ExportError::OutputValidation));
 		std::fs::create_dir(&files.stage).unwrap();
@@ -1481,6 +1690,29 @@ mod tests {
 			media("h264", Some("aac"), "mov,mp4", 0, 1080),
 			media("h264", Some("aac"), "mov,mp4", 1280, 720),
 		] {
+			assert_eq!(
+				expected.validate(&bytes),
+				Err(ExportError::OutputValidation)
+			);
+		}
+	}
+
+	#[test]
+	fn mp4_metadata_without_video_payload_is_not_success() {
+		let expected = MediaExpectation::composite(&settings("mp4-h264"), "16:9", None);
+		for packet_count in [
+			serde_json::Value::Null,
+			serde_json::json!("0"),
+			serde_json::json!(0),
+		] {
+			let bytes = serde_json::to_vec(&serde_json::json!({
+				"streams": [
+					{"codec_type":"video", "codec_name":"h264", "width":1920, "height":1080, "nb_read_packets":packet_count},
+					{"codec_type":"audio", "codec_name":"aac"}
+				],
+				"format":{"format_name":"mov,mp4"}
+			}))
+			.unwrap();
 			assert_eq!(
 				expected.validate(&bytes),
 				Err(ExportError::OutputValidation)
@@ -1521,10 +1753,47 @@ mod tests {
 		fixture.sentinel();
 	}
 
+	#[cfg(windows)]
+	#[test]
+	fn windows_stage_guard_blocks_replacement_during_encode_and_validation() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let displaced = fixture.0.join("displaced.mp4");
+
+		assert!(std::fs::rename(&files.stage, &displaced).is_err());
+		assert_eq!(std::fs::read(&files.stage).unwrap(), b"candidate");
+		assert!(files.validate_file().is_ok());
+		assert!(!files.cleanup());
+		assert!(!files.stage.exists());
+		assert!(!displaced.exists());
+		fixture.sentinel();
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_foreign_stage_replacement_is_not_published_or_cleaned() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let owned = fixture.0.join("owned-but-displaced.mp4");
+
+		assert!(files.validate_file().is_ok());
+		drop(files.stage_guard.take());
+		std::fs::rename(&files.stage, &owned).unwrap();
+		std::fs::write(&files.stage, b"foreign replacement").unwrap();
+
+		assert!(files.publish_stage().is_err());
+		fixture.sentinel();
+		assert!(files.cleanup());
+		assert_eq!(std::fs::read(&files.stage).unwrap(), b"foreign replacement");
+		assert_eq!(std::fs::read(&owned).unwrap(), b"candidate");
+	}
+
 	#[test]
 	fn cleanup_failure_preserves_primary_sanitized_error() {
 		let fixture = Fixture::new();
 		let mut files = fixture.files();
+		#[cfg(windows)]
+		drop(files.stage_guard.take());
 		std::fs::remove_file(&files.stage).unwrap();
 		std::fs::create_dir(&files.stage).unwrap();
 		let message = finish_cleanup(&mut files, Err(ExportError::Process)).unwrap_err();
@@ -1678,7 +1947,7 @@ mod tests {
 	fn publication_follows_validation_and_completion_follows_rename() {
 		use std::cell::Cell;
 		let fixture = Fixture::new();
-		let files = fixture.files();
+		let mut files = fixture.files();
 		let phase = Cell::new(0);
 		files
 			.finish(
@@ -1688,17 +1957,23 @@ mod tests {
 					phase.set(1);
 					Ok(())
 				},
-				|stage, destination| {
+				|files| {
 					assert_eq!(phase.get(), 1);
 					fixture.sentinel();
-					// A deterministic publication seam; native replacement separately below.
-					assert_eq!(std::fs::read(stage).unwrap(), b"candidate");
-					assert_eq!(destination, fixture.destination());
+					assert_eq!(std::fs::read(&files.stage).unwrap(), b"candidate");
+					assert_eq!(
+						files.destination,
+						std::fs::canonicalize(&fixture.0)
+							.unwrap()
+							.join("destination.mp4")
+					);
+					files.publish_stage()?;
 					phase.set(2);
 					Ok(())
 				},
 				|| {
 					assert_eq!(phase.get(), 2);
+					assert_eq!(std::fs::read(fixture.destination()).unwrap(), b"candidate");
 					phase.set(3);
 				},
 			)
@@ -1710,7 +1985,7 @@ mod tests {
 	#[test]
 	fn native_same_directory_rename_replaces_only_after_validation() {
 		let fixture = Fixture::new();
-		let files = fixture.files();
+		let mut files = fixture.files();
 		files
 			.finish(
 				Ok(()),
@@ -1718,7 +1993,7 @@ mod tests {
 					fixture.sentinel();
 					Ok(())
 				},
-				|stage, dest| std::fs::rename(stage, dest),
+				ExportFiles::publish_stage,
 				|| {
 					assert_eq!(std::fs::read(fixture.destination()).unwrap(), b"candidate");
 				},
@@ -1854,7 +2129,7 @@ where
 /// and no failure (including NVENC-like stderr) can trigger a CPU retry.
 async fn run_export(
 	app: &AppHandle,
-	files: &ExportFiles,
+	files: &mut ExportFiles,
 	args: Vec<String>,
 	total: f64,
 	expected: &MediaExpectation,
@@ -1865,8 +2140,9 @@ async fn run_export(
 	let args: Vec<String> = [
 		"-v",
 		"error",
+		"-count_packets",
 		"-show_entries",
-		"stream=codec_type,codec_name,width,height:format=format_name",
+		"stream=codec_type,codec_name,width,height,nb_read_packets:format=format_name",
 		"-of",
 		"json",
 	]
@@ -1881,7 +2157,7 @@ async fn run_export(
 	files.finish(
 		Ok(()),
 		|| expected.validate(&probe.stdout),
-		|stage, destination| std::fs::rename(stage, destination),
+		ExportFiles::publish_stage,
 		|| {
 			let _ = app.emit("export:progress", 1.0_f64);
 		},

@@ -10,17 +10,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use std::{
 	ffi::OsStr,
-	os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
+	os::windows::{
+		ffi::OsStrExt,
+		fs::OpenOptionsExt,
+		io::{AsRawHandle, FromRawHandle},
+	},
 };
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
 #[cfg(windows)]
 use windows_sys::Win32::{
-	Foundation::GENERIC_READ,
+	Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
 	Storage::FileSystem::{
 		FileDispositionInfo, FileIdInfo, FileRenameInfo, GetFileInformationByHandleEx,
-		SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
+		ReOpenFile, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
 		FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 	},
 };
@@ -311,24 +315,65 @@ fn open_owned_windows_file(
 }
 
 #[cfg(windows)]
+fn reopen_owned_windows_file(
+	guard: &std::fs::File,
+	expected: WindowsFileIdentity,
+	access_mode: u32,
+	share_mode: u32,
+) -> std::io::Result<std::fs::File> {
+	// ReOpenFile addresses the retained object, even after its name changes.
+	let handle = unsafe { ReOpenFile(guard.as_raw_handle(), access_mode, share_mode, 0) };
+	if handle == INVALID_HANDLE_VALUE {
+		return Err(std::io::Error::last_os_error());
+	}
+	let file = unsafe { std::fs::File::from_raw_handle(handle) };
+	if windows_file_identity(&file)? != expected {
+		return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+	}
+	Ok(file)
+}
+
+#[cfg(windows)]
 struct WindowsTextFile {
-	path: PathBuf,
 	guard: Option<std::fs::File>,
+	path_guard: Option<std::fs::File>,
 	identity: WindowsFileIdentity,
 }
 
 #[cfg(windows)]
 impl WindowsTextFile {
 	fn cleanup(&mut self) -> bool {
-		drop(self.guard.take());
-		open_owned_windows_file(
-			&self.path,
+		if self.guard.is_none() {
+			let Some(pin) = self.path_guard.as_ref() else {
+				return false;
+			};
+			let Ok(guard) = reopen_owned_windows_file(
+				pin,
+				self.identity,
+				GENERIC_READ,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			) else {
+				return false;
+			};
+			self.guard = Some(guard);
+		}
+		// Release only pathname exclusion; object authority remains continuous.
+		drop(self.path_guard.take());
+		let Some(guard) = self.guard.as_ref() else {
+			return false;
+		};
+		let removed = reopen_owned_windows_file(
+			guard,
 			self.identity,
 			GENERIC_READ | DELETE,
-			FILE_SHARE_READ | FILE_SHARE_WRITE,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 		)
 		.and_then(|file| delete_windows_file(&file))
-		.is_ok()
+		.is_ok();
+		if removed {
+			drop(self.guard.take());
+		}
+		removed
 	}
 }
 
@@ -384,14 +429,16 @@ fn delete_windows_file(file: &std::fs::File) -> std::io::Result<()> {
 }
 
 /// Only objects successfully reserved with create_new belong to this invocation.
-/// Windows keeps the reserved object open while FFmpeg and ffprobe use its path,
-/// then compares FILE_ID_INFO before handle-relative publication or cleanup.
+/// Windows pins the pathname while media tools use it, then retains the sealed
+/// object through handle-relative publication or cleanup without a pathname open.
 struct ExportFiles {
 	destination: PathBuf,
 	stage: PathBuf,
 	stage_owned: bool,
 	#[cfg(windows)]
 	stage_guard: Option<std::fs::File>,
+	#[cfg(windows)]
+	stage_path_guard: Option<std::fs::File>,
 	#[cfg(windows)]
 	stage_identity: WindowsFileIdentity,
 	#[cfg(windows)]
@@ -434,6 +481,8 @@ impl ExportFiles {
 			#[cfg(windows)]
 			stage_guard: Some(stage_guard),
 			#[cfg(windows)]
+			stage_path_guard: None,
+			#[cfg(windows)]
 			stage_identity,
 			#[cfg(windows)]
 			stage_sealed: false,
@@ -460,14 +509,23 @@ impl ExportFiles {
 			let identity = windows_file_identity(&file)
 				.map_err(|_| ExportError::OutputPreparation)?;
 			self.text.push(WindowsTextFile {
-				path: path.clone(),
-				guard: Some(file),
+				guard: None,
+				path_guard: Some(file),
 				identity,
 			});
+			let owned = self.text.last_mut().ok_or(ExportError::OutputPreparation)?;
+			owned.guard = Some(
+				reopen_owned_windows_file(
+					owned.path_guard.as_ref().ok_or(ExportError::OutputPreparation)?,
+					identity,
+					GENERIC_READ,
+					FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				).map_err(|_| ExportError::OutputPreparation)?,
+			);
 			let guard = self
 				.text
 				.last_mut()
-				.and_then(|owned| owned.guard.as_mut())
+				.and_then(|owned| owned.path_guard.as_mut())
 				.ok_or(ExportError::OutputPreparation)?;
 			guard
 				.write_all(content.as_bytes())
@@ -504,13 +562,21 @@ impl ExportFiles {
 			return Ok(());
 		}
 		drop(self.stage_guard.take());
-		let guard = open_owned_windows_file(
+		let path_guard = open_owned_windows_file(
 			&self.stage,
 			self.stage_identity,
 			GENERIC_READ,
-			FILE_SHARE_READ | FILE_SHARE_DELETE,
+			FILE_SHARE_READ,
 		)?;
-		self.stage_guard = Some(guard);
+		self.stage_path_guard = Some(path_guard);
+		self.stage_guard = Some(reopen_owned_windows_file(
+			self.stage_path_guard.as_ref().ok_or_else(|| {
+				std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+			})?,
+			self.stage_identity,
+			GENERIC_READ,
+			FILE_SHARE_READ | FILE_SHARE_DELETE,
+		)?);
 		self.stage_sealed = true;
 		Ok(())
 	}
@@ -572,12 +638,13 @@ impl ExportFiles {
 		#[cfg(windows)]
 		if self.stage_owned {
 			let removed = if self.stage_sealed {
-				if self.stage_guard.is_some() {
-					open_owned_windows_file(
-						&self.stage,
+				drop(self.stage_path_guard.take());
+				if let Some(guard) = self.stage_guard.as_ref() {
+					reopen_owned_windows_file(
+						guard,
 						self.stage_identity,
 						GENERIC_READ | DELETE,
-						FILE_SHARE_READ,
+						FILE_SHARE_READ | FILE_SHARE_DELETE,
 					)
 					.and_then(|file| delete_windows_file(&file))
 					.is_ok()
@@ -585,6 +652,7 @@ impl ExportFiles {
 					false
 				}
 			} else {
+				drop(self.stage_path_guard.take());
 				drop(self.stage_guard.take());
 				open_owned_windows_file(
 					&self.stage,
@@ -616,14 +684,15 @@ impl ExportFiles {
 		#[cfg(windows)]
 		{
 			self.seal_stage()?;
-			self.stage_guard.as_ref().ok_or_else(|| {
+			let guard = self.stage_guard.as_ref().ok_or_else(|| {
 				std::io::Error::new(std::io::ErrorKind::PermissionDenied, "stage seal lost")
 			})?;
-			let publication = open_owned_windows_file(
-				&self.stage,
+			drop(self.stage_path_guard.take());
+			let publication = reopen_owned_windows_file(
+				guard,
 				self.stage_identity,
 				GENERIC_READ | DELETE,
-				FILE_SHARE_READ,
+				FILE_SHARE_READ | FILE_SHARE_DELETE,
 			)?;
 			rename_windows_file(&publication, &self.destination)?;
 			self.stage_owned = false;
@@ -1793,7 +1862,10 @@ mod tests {
 			Err(ExportError::OutputValidation)
 		);
 		#[cfg(windows)]
-		drop(files.stage_guard.take());
+		{
+			drop(files.stage_path_guard.take());
+			drop(files.stage_guard.take());
+		}
 		std::fs::remove_file(&files.stage).unwrap();
 		assert_eq!(files.validate_file(), Err(ExportError::OutputValidation));
 		std::fs::create_dir(&files.stage).unwrap();
@@ -1953,6 +2025,7 @@ mod tests {
 		let owned = fixture.0.join("owned-but-displaced.mp4");
 
 		assert!(files.validate_file().is_ok());
+		drop(files.stage_path_guard.take());
 		drop(files.stage_guard.take());
 		std::fs::rename(&files.stage, &owned).unwrap();
 		std::fs::write(&files.stage, b"foreign replacement").unwrap();
@@ -2040,13 +2113,187 @@ mod tests {
 				.unwrap(),
 		);
 		let displaced = fixture.0.join("owned-text-displaced.txt");
-		drop(files.text[0].guard.take());
+		assert!(std::fs::rename(&path, &displaced).is_err());
+		// The cleanup transition releases pathname exclusion, but not the object.
+		drop(files.text[0].path_guard.take());
 		std::fs::rename(&path, &displaced).unwrap();
 		std::fs::write(&path, b"foreign replacement").unwrap();
 
-		assert!(files.cleanup());
+		assert!(!files.cleanup());
 		assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
-		assert_eq!(std::fs::read(&displaced).unwrap(), b"owned");
+		assert!(!displaced.exists());
+		assert!(!files.cleanup());
+		assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_text_failed_cleanup_retains_authority_for_retry() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let path = PathBuf::from(files.reserve_text("owned", &invocation_token(), 0).unwrap());
+		let reader = std::fs::OpenOptions::new().read(true)
+			.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(&path).unwrap();
+		assert!(files.cleanup());
+		assert!(files.text[0].guard.is_some());
+		assert!(files.text[0].path_guard.is_none());
+		drop(reader);
+		let displaced = fixture.0.join("owned-after-failed-cleanup.txt");
+		std::fs::rename(&path, &displaced).unwrap();
+		std::fs::write(&path, b"foreign replacement").unwrap();
+		assert!(!files.cleanup());
+		assert!(!displaced.exists());
+		assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
+		std::fs::remove_file(&path).unwrap();
+		fixture.sentinel();
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_stage_publication_keeps_sealed_object_after_path_release() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let stage = files.stage.clone();
+		let displaced = fixture.0.join("validated-owned.mp4");
+		let complete = std::cell::Cell::new(false);
+		files.finish(
+			Ok(()), || Ok(()),
+			|files| {
+				// Exercise displacement at publication's unpin/reopen boundary.
+				drop(files.stage_path_guard.take());
+				std::fs::rename(&stage, &displaced)?;
+				std::fs::write(&stage, b"foreign replacement")?;
+				assert!(std::fs::OpenOptions::new().write(true)
+					.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+					.open(&displaced).is_err());
+				files.publish_stage()
+			}, || complete.set(true),
+		).unwrap();
+		assert!(complete.get());
+		assert_eq!(std::fs::read(fixture.destination()).unwrap(), b"candidate");
+		assert_eq!(std::fs::read(&stage).unwrap(), b"foreign replacement");
+		assert!(!displaced.exists());
+		assert!(!files.cleanup());
+		assert_eq!(std::fs::read(&stage).unwrap(), b"foreign replacement");
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_sealed_stage_cleanup_keeps_object_after_path_release() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let displaced = fixture.0.join("owned-stage-displaced.mp4");
+		files.validate_file().unwrap();
+		drop(files.stage_path_guard.take());
+		std::fs::rename(&files.stage, &displaced).unwrap();
+		std::fs::write(&files.stage, b"foreign replacement").unwrap();
+		assert!(!files.cleanup());
+		assert!(!displaced.exists());
+		assert_eq!(std::fs::read(&files.stage).unwrap(), b"foreign replacement");
+		fixture.sentinel();
+	}
+
+	#[cfg(windows)]
+	fn native_tool(name: &str) -> PathBuf {
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries")
+			.join(format!("{name}-x86_64-pc-windows-msvc.exe"))
+	}
+
+	#[cfg(windows)]
+	fn native_probe(path: &Path) -> std::process::Output {
+		std::process::Command::new(native_tool("ffprobe"))
+			.args(["-v", "error", "-count_packets", "-show_entries",
+				"stream=codec_type,codec_name,width,height,nb_read_packets:format=format_name",
+				"-of", "json"])
+			.arg(path).output().expect("qualification ffprobe")
+	}
+
+	#[cfg(windows)]
+	#[test]
+	#[ignore = "requires locally provisioned FFmpeg/ffprobe sidecars"]
+	fn windows_native_stage_substitution_cannot_validate_foreign_media() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files(); // invalid owned bytes
+		let foreign = fixture.0.join("foreign-valid.mp4");
+		let out = std::process::Command::new(native_tool("ffmpeg"))
+			.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi",
+				"-i", "color=c=black:s=64x64:r=30", "-frames:v", "3", "-an",
+				"-c:v", "libx264", "-pix_fmt", "yuv420p"])
+			.arg(&foreign).output().unwrap();
+		assert!(out.status.success(), "fixture encoding failed");
+		let foreign_bytes = std::fs::read(&foreign).unwrap();
+		let expected = MediaExpectation::copied("mp4-h264", Some((64, 64)), "h264", None);
+		let probe = native_probe(&foreign);
+		assert!(probe.status.success());
+		expected.validate(&probe.stdout).unwrap();
+		files.validate_file().unwrap();
+		let displaced = fixture.0.join("owned-displaced.mp4");
+		// Deterministic boundary before ffprobe, matching the residual R1 schedule.
+		assert!(std::fs::rename(&files.stage, &displaced).is_err());
+		assert!(std::fs::rename(&foreign, &files.stage).is_err());
+		assert!(std::fs::rename(&fixture.0, fixture.0.with_extension("displaced")).is_err());
+		assert!(std::fs::OpenOptions::new().write(true)
+			.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+			.open(&files.stage).is_err());
+		let probe = native_probe(&files.stage);
+		assert!(!probe.status.success());
+		let complete = std::cell::Cell::new(false);
+		assert_eq!(files.finish(Ok(()), || expected.validate(&probe.stdout),
+			ExportFiles::publish_stage, || complete.set(true)), Err(ExportError::OutputValidation));
+		assert!(!complete.get());
+		fixture.sentinel();
+		assert_eq!(std::fs::read(&foreign).unwrap(), foreign_bytes);
+		assert!(!files.cleanup());
+		assert!(!files.stage.exists());
+		// Actual FFmpeg writes the reserved path; actual ffprobe reads under the seal.
+		let mut valid = fixture.files();
+		let encoded = std::process::Command::new(native_tool("ffmpeg"))
+			.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "lavfi",
+				"-i", "color=c=black:s=64x64:r=30", "-frames:v", "3", "-an",
+				"-c:v", "libx264", "-pix_fmt", "yuv420p"])
+			.arg(&valid.stage).output().unwrap();
+		assert!(encoded.status.success(), "owned encoding failed");
+		valid.validate_file().unwrap();
+		let probe = native_probe(&valid.stage);
+		assert!(probe.status.success(), "sealed ffprobe access failed");
+		let validated_bytes = std::fs::read(&valid.stage).unwrap();
+		valid.finish(Ok(()), || expected.validate(&probe.stdout),
+			ExportFiles::publish_stage, || complete.set(true)).unwrap();
+		assert!(complete.get());
+		assert_eq!(std::fs::read(fixture.destination()).unwrap(), validated_bytes);
+		assert_eq!(std::fs::read(&foreign).unwrap(), foreign_bytes);
+	}
+
+	#[cfg(windows)]
+	#[test]
+	#[ignore = "requires locally provisioned FFmpeg sidecar and qualification font"]
+	fn windows_native_text_access_and_displaced_owned_cleanup() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let token = invocation_token();
+		let path = PathBuf::from(files.reserve_text("native text", &token, 0).unwrap());
+		assert!(files.reserve_text("overwrite", &token, 0).is_err());
+		let displaced = fixture.0.join("owned-text.txt");
+		assert!(std::fs::rename(&path, &displaced).is_err());
+		std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("../static/fonts/qualification-only.ttf"), fixture.0.join("font.ttf")).unwrap();
+		let escaped = path.to_string_lossy().replace('\\', "/").replace(':', "\\:");
+		let filter = format!("drawtext=fontfile='font.ttf':textfile='{escaped}':fontsize=12:fontcolor=white");
+		let out = std::process::Command::new(native_tool("ffmpeg")).current_dir(&fixture.0)
+			.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi",
+				"-i", "color=c=black:s=64x64:r=30", "-vf", &filter,
+				"-frames:v", "1", "-f", "null", "-"]).output().unwrap();
+		assert!(out.status.success(), "native text access failed");
+		assert_eq!(std::fs::read(&path).unwrap(), b"native text");
+		// Displace at cleanup's unpin/reopen boundary without relinquishing authority.
+		drop(files.text[0].path_guard.take());
+		std::fs::rename(&path, &displaced).unwrap();
+		std::fs::write(&path, b"foreign replacement").unwrap();
+		assert!(!files.cleanup());
+		assert!(!displaced.exists());
+		assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
+		std::fs::remove_file(&path).unwrap(); // fixture-owned substitute only
+		fixture.sentinel();
 	}
 
 	#[test]

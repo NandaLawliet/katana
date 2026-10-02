@@ -21,7 +21,7 @@ use windows_sys::Win32::{
 	Storage::FileSystem::{
 		FileDispositionInfo, FileIdInfo, FileRenameInfo, GetFileInformationByHandleEx,
 		SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
-		FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
+		FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 	},
 };
 
@@ -289,14 +289,16 @@ fn reserve_windows_stage(path: &Path) -> std::io::Result<(std::fs::File, Windows
 }
 
 #[cfg(windows)]
-fn open_owned_windows_stage(
+fn open_owned_windows_file(
 	path: &Path,
 	expected: WindowsFileIdentity,
+	access_mode: u32,
+	share_mode: u32,
 ) -> std::io::Result<std::fs::File> {
 	let file = std::fs::OpenOptions::new()
 		.read(true)
-		.access_mode(GENERIC_READ | DELETE)
-		.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+		.access_mode(access_mode)
+		.share_mode(share_mode)
 		.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
 		.open(path)?;
 	if windows_file_identity(&file)? != expected {
@@ -306,6 +308,28 @@ fn open_owned_windows_stage(
 		));
 	}
 	Ok(file)
+}
+
+#[cfg(windows)]
+struct WindowsTextFile {
+	path: PathBuf,
+	guard: Option<std::fs::File>,
+	identity: WindowsFileIdentity,
+}
+
+#[cfg(windows)]
+impl WindowsTextFile {
+	fn cleanup(&mut self) -> bool {
+		drop(self.guard.take());
+		open_owned_windows_file(
+			&self.path,
+			self.identity,
+			GENERIC_READ | DELETE,
+			FILE_SHARE_READ | FILE_SHARE_WRITE,
+		)
+		.and_then(|file| delete_windows_file(&file))
+		.is_ok()
+	}
 }
 
 #[cfg(windows)]
@@ -370,6 +394,11 @@ struct ExportFiles {
 	stage_guard: Option<std::fs::File>,
 	#[cfg(windows)]
 	stage_identity: WindowsFileIdentity,
+	#[cfg(windows)]
+	stage_sealed: bool,
+	#[cfg(windows)]
+	text: Vec<WindowsTextFile>,
+	#[cfg(not(windows))]
 	text: Vec<PathBuf>,
 }
 
@@ -406,6 +435,8 @@ impl ExportFiles {
 			stage_guard: Some(stage_guard),
 			#[cfg(windows)]
 			stage_identity,
+			#[cfg(windows)]
+			stage_sealed: false,
 			text: Vec::new(),
 		})
 	}
@@ -417,6 +448,35 @@ impl ExportFiles {
 		index: usize,
 	) -> Result<String, ExportError> {
 		let path = std::env::temp_dir().join(format!("katana-text-{token}-{index}.txt"));
+		#[cfg(windows)]
+		{
+			let file = std::fs::OpenOptions::new()
+				.read(true)
+				.write(true)
+				.create_new(true)
+				.share_mode(FILE_SHARE_READ)
+				.open(&path)
+				.map_err(|_| ExportError::OutputPreparation)?;
+			let identity = windows_file_identity(&file)
+				.map_err(|_| ExportError::OutputPreparation)?;
+			self.text.push(WindowsTextFile {
+				path: path.clone(),
+				guard: Some(file),
+				identity,
+			});
+			let guard = self
+				.text
+				.last_mut()
+				.and_then(|owned| owned.guard.as_mut())
+				.ok_or(ExportError::OutputPreparation)?;
+			guard
+				.write_all(content.as_bytes())
+				.map_err(|_| ExportError::OutputPreparation)?;
+			guard.flush().map_err(|_| ExportError::OutputPreparation)?;
+			Ok(path.to_string_lossy().into_owned())
+		}
+		#[cfg(not(windows))]
+		{
 		let mut file = std::fs::OpenOptions::new()
 			.write(true)
 			.create_new(true)
@@ -426,11 +486,40 @@ impl ExportFiles {
 		file.write_all(content.as_bytes())
 			.map_err(|_| ExportError::OutputPreparation)?;
 		Ok(path.to_string_lossy().into_owned())
+		}
 	}
 
-	fn validate_file(&self) -> Result<(), ExportError> {
+	#[cfg(windows)]
+	fn seal_stage(&mut self) -> std::io::Result<()> {
+		if self.stage_sealed {
+			let guard = self.stage_guard.as_ref().ok_or_else(|| {
+				std::io::Error::new(std::io::ErrorKind::PermissionDenied, "stage seal lost")
+			})?;
+			if windows_file_identity(guard)? != self.stage_identity {
+				return Err(std::io::Error::new(
+					std::io::ErrorKind::PermissionDenied,
+					"stage object identity changed",
+				));
+			}
+			return Ok(());
+		}
+		drop(self.stage_guard.take());
+		let guard = open_owned_windows_file(
+			&self.stage,
+			self.stage_identity,
+			GENERIC_READ,
+			FILE_SHARE_READ | FILE_SHARE_DELETE,
+		)?;
+		self.stage_guard = Some(guard);
+		self.stage_sealed = true;
+		Ok(())
+	}
+
+	fn validate_file(&mut self) -> Result<(), ExportError> {
 		#[cfg(windows)]
 		{
+			self.seal_stage()
+				.map_err(|_| ExportError::OutputValidation)?;
 			let guard = self
 				.stage_guard
 				.as_ref()
@@ -442,7 +531,7 @@ impl ExportFiles {
 			}
 			let path_file = std::fs::OpenOptions::new()
 				.read(true)
-				.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+				.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
 				.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
 				.open(&self.stage)
 				.map_err(|_| ExportError::OutputValidation)?;
@@ -473,6 +562,7 @@ impl ExportFiles {
 	}
 
 	fn cleanup(&mut self) -> bool {
+		#[cfg(not(windows))]
 		fn remove(path: &Path) -> bool {
 			match std::fs::remove_file(path) {
 				Ok(()) => true,
@@ -481,11 +571,33 @@ impl ExportFiles {
 		}
 		#[cfg(windows)]
 		if self.stage_owned {
-			drop(self.stage_guard.take());
-			if open_owned_windows_stage(&self.stage, self.stage_identity)
+			let removed = if self.stage_sealed {
+				if self.stage_guard.is_some() {
+					open_owned_windows_file(
+						&self.stage,
+						self.stage_identity,
+						GENERIC_READ | DELETE,
+						FILE_SHARE_READ,
+					)
+					.and_then(|file| delete_windows_file(&file))
+					.is_ok()
+				} else {
+					false
+				}
+			} else {
+				drop(self.stage_guard.take());
+				open_owned_windows_file(
+					&self.stage,
+					self.stage_identity,
+					GENERIC_READ | DELETE,
+					FILE_SHARE_READ | FILE_SHARE_WRITE,
+				)
 				.and_then(|file| delete_windows_file(&file))
 				.is_ok()
-			{
+			};
+			drop(self.stage_guard.take());
+			self.stage_sealed = false;
+			if removed {
 				self.stage_owned = false;
 			}
 		}
@@ -493,6 +605,9 @@ impl ExportFiles {
 		if self.stage_owned && remove(&self.stage) {
 			self.stage_owned = false;
 		}
+		#[cfg(windows)]
+		self.text.retain_mut(|owned| !owned.cleanup());
+		#[cfg(not(windows))]
 		self.text.retain(|path| !remove(path));
 		self.stage_owned || !self.text.is_empty()
 	}
@@ -500,10 +615,20 @@ impl ExportFiles {
 	fn publish_stage(&mut self) -> std::io::Result<()> {
 		#[cfg(windows)]
 		{
-			drop(self.stage_guard.take());
-			let file = open_owned_windows_stage(&self.stage, self.stage_identity)?;
-			rename_windows_file(&file, &self.destination)?;
+			self.seal_stage()?;
+			self.stage_guard.as_ref().ok_or_else(|| {
+				std::io::Error::new(std::io::ErrorKind::PermissionDenied, "stage seal lost")
+			})?;
+			let publication = open_owned_windows_file(
+				&self.stage,
+				self.stage_identity,
+				GENERIC_READ | DELETE,
+				FILE_SHARE_READ,
+			)?;
+			rename_windows_file(&publication, &self.destination)?;
 			self.stage_owned = false;
+			self.stage_sealed = false;
+			drop(self.stage_guard.take());
 			Ok(())
 		}
 		#[cfg(not(windows))]
@@ -1771,6 +1896,57 @@ mod tests {
 
 	#[cfg(windows)]
 	#[test]
+	fn windows_stage_seal_blocks_mutation_after_validation_until_publication() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let stage = files.stage.clone();
+
+		files
+			.finish(
+				Ok(()),
+				|| {
+					assert!(std::fs::OpenOptions::new()
+						.write(true)
+						.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+						.open(&stage)
+						.is_err());
+					Ok(())
+				},
+				ExportFiles::publish_stage,
+				|| {},
+			)
+			.unwrap();
+
+		assert_eq!(std::fs::read(fixture.destination()).unwrap(), b"candidate");
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_already_open_stage_writer_fails_seal_and_preserves_destination() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let writer = std::fs::OpenOptions::new()
+			.write(true)
+			.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+			.open(&files.stage)
+			.unwrap();
+
+		assert_eq!(
+			files.finish(
+				Ok(()),
+				|| panic!("validation with an open writer"),
+				|_| panic!("publication with an open writer"),
+				|| panic!("completion with an open writer"),
+			),
+			Err(ExportError::OutputValidation)
+		);
+		fixture.sentinel();
+		drop(writer);
+		assert!(!files.cleanup());
+	}
+
+	#[cfg(windows)]
+	#[test]
 	fn windows_foreign_stage_replacement_is_not_published_or_cleaned() {
 		let fixture = Fixture::new();
 		let mut files = fixture.files();
@@ -1837,6 +2013,40 @@ mod tests {
 		assert!(other.reserve_text("overwrite", &token, 0).is_err());
 		assert!(!other.cleanup());
 		assert_eq!(std::fs::read(&path).unwrap(), b"foreign");
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_text_guard_allows_reader_and_cleanup_deletes_owned_object() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let path = files
+			.reserve_text("reader-visible", &invocation_token(), 0)
+			.unwrap();
+
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), "reader-visible");
+		assert!(!files.cleanup());
+		assert!(!Path::new(&path).exists());
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_text_displacement_cannot_redirect_cleanup_to_foreign_replacement() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let path = PathBuf::from(
+			files
+				.reserve_text("owned", &invocation_token(), 0)
+				.unwrap(),
+		);
+		let displaced = fixture.0.join("owned-text-displaced.txt");
+		drop(files.text[0].guard.take());
+		std::fs::rename(&path, &displaced).unwrap();
+		std::fs::write(&path, b"foreign replacement").unwrap();
+
+		assert!(files.cleanup());
+		assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
+		assert_eq!(std::fs::read(&displaced).unwrap(), b"owned");
 	}
 
 	#[test]

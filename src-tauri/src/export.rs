@@ -224,8 +224,8 @@ fn invocation_token() -> String {
 	)
 }
 
-/// Canonical paths cover relative paths and symlinks. Unix additionally covers
-/// hard links by inode/device. No claim of universal alias/race detection.
+/// Canonical paths cover relative paths and symlinks. Native object identities
+/// also cover provable hard links. No claim of universal alias/race detection.
 fn reject_source_destination(destination: &Path, sources: &[&Path]) -> Result<(), ExportError> {
 	fn location(path: &Path) -> std::io::Result<PathBuf> {
 		std::fs::canonicalize(path).or_else(|_| {
@@ -240,6 +240,15 @@ fn reject_source_destination(destination: &Path, sources: &[&Path]) -> Result<()
 	for source in sources {
 		if location(source).ok().as_ref() == Some(&dest) {
 			return Err(ExportError::InvalidRequest);
+		}
+		#[cfg(windows)]
+		if let (Ok(d), Ok(s)) = (
+			windows_regular_file_identity(destination),
+			windows_regular_file_identity(source),
+		) {
+			if d.is_some() && d == s {
+				return Err(ExportError::InvalidRequest);
+			}
 		}
 		#[cfg(unix)]
 		if let (Ok(d), Ok(s)) = (std::fs::metadata(destination), std::fs::metadata(source)) {
@@ -257,6 +266,20 @@ fn reject_source_destination(destination: &Path, sources: &[&Path]) -> Result<()
 struct WindowsFileIdentity {
 	volume: u64,
 	file_id: [u8; 16],
+}
+
+#[cfg(windows)]
+fn windows_regular_file_identity(path: &Path) -> std::io::Result<Option<WindowsFileIdentity>> {
+	let file = std::fs::OpenOptions::new()
+		.read(true)
+		.access_mode(0)
+		.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+		.open(path)?;
+	if file.metadata()?.is_file() {
+		windows_file_identity(&file).map(Some)
+	} else {
+		Ok(None)
+	}
 }
 
 #[cfg(windows)]
@@ -663,9 +686,9 @@ impl ExportFiles {
 				.and_then(|file| delete_windows_file(&file))
 				.is_ok()
 			};
-			drop(self.stage_guard.take());
-			self.stage_sealed = false;
 			if removed {
+				drop(self.stage_guard.take());
+				self.stage_sealed = false;
 				self.stage_owned = false;
 			}
 		}
@@ -752,7 +775,7 @@ fn finish_cleanup(files: &mut ExportFiles, result: Result<(), ExportError>) -> R
 #[derive(Debug)]
 struct MediaExpectation {
 	format: String,
-	dimensions: Option<(u32, u32)>,
+	dimensions: (u32, u32),
 	video: String,
 	audio: Option<String>,
 }
@@ -769,7 +792,7 @@ impl MediaExpectation {
 		};
 		Self {
 			format: settings.format.clone(),
-			dimensions: Some((w as u32, h as u32)),
+			dimensions: (w as u32, h as u32),
 			video: video.into(),
 			audio: audio.map(String::from),
 		}
@@ -777,7 +800,7 @@ impl MediaExpectation {
 
 	fn copied(
 		format: &str,
-		dimensions: Option<(u32, u32)>,
+		dimensions: (u32, u32),
 		video: &str,
 		audio: Option<&str>,
 	) -> Self {
@@ -824,19 +847,19 @@ impl MediaExpectation {
 		{
 			return Err(ExportError::OutputValidation);
 		}
-		if self
-			.dimensions
-			.is_some_and(|(ew, eh)| w != ew as u64 || h != eh as u64)
-		{
+		let (ew, eh) = self.dimensions;
+		if w != ew as u64 || h != eh as u64 {
 			return Err(ExportError::OutputValidation);
 		}
-		if let Some(codec) = &self.audio {
-			if !streams.iter().any(|s| {
-				s.get("codec_type").and_then(|v| v.as_str()) == Some("audio")
-					&& s.get("codec_name").and_then(|v| v.as_str()) == Some(codec.as_str())
-			}) {
-				return Err(ExportError::OutputValidation);
-			}
+		let mut audio = streams.iter().filter(|s| {
+			s.get("codec_type").and_then(|v| v.as_str()) == Some("audio")
+		});
+		match (&self.audio, audio.next()) {
+			(None, None) => {},
+			(Some(codec), Some(stream))
+				if stream.get("codec_name").and_then(|v| v.as_str()) == Some(codec.as_str())
+					&& audio.next().is_none() => {},
+			_ => return Err(ExportError::OutputValidation),
 		}
 		Ok(())
 	}
@@ -1384,23 +1407,78 @@ fn build_args(
 	Ok((args, total))
 }
 
-/// Probe a single stream's codec name (e.g. "h264", "aac"); None if absent.
-async fn probe_codec(app: &AppHandle, path: &str, stream: &str) -> Option<String> {
-	let cmd = app.shell().sidecar("ffprobe").ok()?;
-	let args = [
-		"-v", "error", "-select_streams", stream, "-show_entries", "stream=codec_name", "-of",
-		"csv=p=0", path,
-	];
-	let out = cmd.args(args).output().await.ok()?;
-	if !out.status.success() {
-		return None;
+/// One successful structured probe defines every stream mapped by the copy path.
+/// Failed probes and missing video metadata are errors; no audio is a known absence.
+fn copy_expectation(
+	format: &str,
+	probe: Result<ProcessOutput, ExportError>,
+) -> Result<Option<MediaExpectation>, ExportError> {
+	let out = probe?;
+	if out.code != 0 {
+		return Err(ExportError::OutputValidation);
 	}
-	let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-	if s.is_empty() {
-		None
+	let value: serde_json::Value =
+		serde_json::from_slice(&out.stdout).map_err(|_| ExportError::OutputValidation)?;
+	let streams = value
+		.get("streams")
+		.and_then(|v| v.as_array())
+		.ok_or(ExportError::OutputValidation)?;
+	let video = streams
+		.iter()
+		.find(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("video"))
+		.ok_or(ExportError::OutputValidation)?;
+	let codec = |stream: &serde_json::Value| -> Result<String, ExportError> {
+		stream
+			.get("codec_name")
+			.and_then(|v| v.as_str())
+			.filter(|s| !s.is_empty())
+			.map(String::from)
+			.ok_or(ExportError::OutputValidation)
+	};
+	let vcodec = codec(video)?;
+	let dimension = |key| -> Result<u32, ExportError> {
+		video
+			.get(key)
+			.and_then(|v| v.as_u64())
+			.and_then(|v| u32::try_from(v).ok())
+			.filter(|v| *v > 0)
+			.ok_or(ExportError::OutputValidation)
+	};
+	let dimensions = (dimension("width")?, dimension("height")?);
+	let audio = streams
+		.iter()
+		.find(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("audio"));
+	let acodec = audio.map(codec).transpose()?;
+	if copy_compatible(format, &vcodec, acodec.as_deref()) {
+		Ok(Some(MediaExpectation::copied(
+			format,
+			dimensions,
+			&vcodec,
+			acodec.as_deref(),
+		)))
 	} else {
-		Some(s)
+		Ok(None)
 	}
+}
+
+async fn probe_copy_expectation(
+	app: &AppHandle,
+	path: &str,
+	format: &str,
+) -> Result<Option<MediaExpectation>, ExportError> {
+	let args = [
+		"-v",
+		"error",
+		"-show_entries",
+		"stream=codec_type,codec_name,width,height",
+		"-of",
+		"json",
+		path,
+	]
+	.iter()
+	.map(|s| s.to_string())
+	.collect();
+	copy_expectation(format, run_media(app, "ffprobe", args, None).await)
 }
 
 /// Structural eligibility for a lossless stream copy: a single, untouched,
@@ -1509,17 +1587,14 @@ pub async fn export_video(
 
 	// Lossless stream-copy fastpath (single trimmed clip, compatible codecs).
 	if let Some(c) = copy_candidate(&clips, &aspect, &settings) {
-		let vcodec = probe_codec(&app, &c.path, "v:0").await;
-		let acodec = probe_codec(&app, &c.path, "a:0").await;
-		if let Some(vc) = vcodec.as_deref() {
-			if copy_compatible(&settings.format, vc, acodec.as_deref()) {
-				let dims = probe_dims(&app, &c.path).await;
-				let expected =
-					MediaExpectation::copied(&settings.format, dims, vc, acodec.as_deref());
+		match probe_copy_expectation(&app, &c.path, &settings.format).await {
+			Ok(Some(expected)) => {
 				let (args, total) = build_copy_args(c, &settings.format, &stage);
 				let result = run_export(&app, &mut files, args, total, &expected).await;
 				return finish_cleanup(&mut files, result);
-			}
+			},
+			Ok(None) => {}, // known incompatible streams use the existing composite route
+			Err(e) => return finish_cleanup(&mut files, Err(e)),
 		}
 	}
 
@@ -2128,6 +2203,75 @@ mod tests {
 
 	#[cfg(windows)]
 	#[test]
+	fn windows_sealed_stage_failed_delete_retains_authority_for_retry_and_drop() {
+		for retry in [true, false] {
+			let fixture = Fixture::new();
+			let mut files = fixture.files();
+			files.validate_file().unwrap();
+			let reader = std::fs::OpenOptions::new()
+				.read(true)
+				.share_mode(FILE_SHARE_READ)
+				.open(&files.stage)
+				.unwrap();
+			let error = finish_cleanup(&mut files, Err(ExportError::Process)).unwrap_err();
+			assert_eq!(
+				error,
+				"Media process failed. Export was not published. Temporary file cleanup also failed."
+			);
+			assert!(files.stage_owned && files.stage_sealed);
+			assert!(files.stage_guard.is_some());
+			assert!(files.stage_path_guard.is_none());
+			drop(reader);
+			let stage = files.stage.clone();
+			let displaced = fixture.0.join("owned-after-denied-delete.mp4");
+			std::fs::rename(&stage, &displaced).unwrap();
+			std::fs::write(&stage, b"foreign replacement").unwrap();
+			if retry {
+				assert!(!files.cleanup());
+				assert!(!files.stage_owned && !files.stage_sealed);
+				assert!(files.stage_guard.is_none());
+				assert!(!files.cleanup());
+			}
+			drop(files);
+			assert!(!displaced.exists());
+			assert_eq!(std::fs::read(&stage).unwrap(), b"foreign replacement");
+			fixture.sentinel();
+		}
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_regular_file_aliases_are_rejected_without_touching_source() {
+		let fixture = Fixture::new();
+		let source = fixture.0.join("source.mp4");
+		let alias = fixture.0.join("alias.mp4");
+		let distinct = fixture.0.join("distinct.mp4");
+		std::fs::write(&source, b"source sentinel").unwrap();
+		std::fs::hard_link(&source, &alias).unwrap();
+		std::fs::write(&distinct, b"source sentinel").unwrap();
+		assert_eq!(
+			windows_regular_file_identity(&source).unwrap(),
+			windows_regular_file_identity(&alias).unwrap()
+		);
+		assert_ne!(
+			windows_regular_file_identity(&source).unwrap(),
+			windows_regular_file_identity(&distinct).unwrap()
+		);
+		assert_eq!(
+			reject_source_destination(&alias, &[&source]),
+			Err(ExportError::InvalidRequest)
+		);
+		assert_eq!(reject_source_destination(&distinct, &[&source]), Ok(()));
+		assert_eq!(
+			reject_source_destination(&fixture.0.join("missing.mp4"), &[&source]),
+			Ok(())
+		);
+		assert_eq!(std::fs::read(&source).unwrap(), b"source sentinel");
+		assert_eq!(std::fs::read(&alias).unwrap(), b"source sentinel");
+	}
+
+	#[cfg(windows)]
+	#[test]
 	fn windows_text_failed_cleanup_retains_authority_for_retry() {
 		let fixture = Fixture::new();
 		let mut files = fixture.files();
@@ -2222,9 +2366,11 @@ mod tests {
 			.arg(&foreign).output().unwrap();
 		assert!(out.status.success(), "fixture encoding failed");
 		let foreign_bytes = std::fs::read(&foreign).unwrap();
-		let expected = MediaExpectation::copied("mp4-h264", Some((64, 64)), "h264", None);
 		let probe = native_probe(&foreign);
 		assert!(probe.status.success());
+		let expected = copy_expectation("mp4-h264", Ok(ProcessOutput {
+			code: probe.status.code().unwrap(), stdout: probe.stdout.clone(),
+		})).unwrap().expect("native silent H.264 source retains stream copy");
 		expected.validate(&probe.stdout).unwrap();
 		files.validate_file().unwrap();
 		let displaced = fixture.0.join("owned-displaced.mp4");
@@ -2328,6 +2474,103 @@ mod tests {
 	}
 
 	#[test]
+	fn copy_planning_rejects_unknown_dimensions_and_audio_before_export() {
+		let probe = |bytes| {
+			Ok(ProcessOutput {
+				code: 0,
+				stdout: bytes,
+			})
+		};
+		let clips = vec![clip()];
+		assert!(copy_candidate(&clips, "original", &settings("mp4-h264")).is_some());
+		for error in [
+			ExportError::Sidecar,
+			ExportError::Spawn,
+			ExportError::Event,
+			ExportError::MissingTermination,
+		] {
+			assert!(matches!(copy_expectation("mp4-h264", Err(error)), Err(e) if e == error));
+		}
+		assert!(matches!(
+			copy_expectation(
+				"mp4-h264",
+				Ok(ProcessOutput {
+					code: 1,
+					stdout: Vec::new()
+				})
+			),
+			Err(ExportError::OutputValidation)
+		));
+		for bytes in [
+			br#"{"streams":[{"codec_type":"video","codec_name":"h264","height":64}]}"#.to_vec(),
+			br#"{"streams":[{"codec_type":"video","codec_name":"h264","width":64,"height":64},{"codec_type":"audio"}]}"#.to_vec(),
+			br#"{"streams":[{"codec_type":"video","codec_name":"h264","width":0,"height":64}]}"#.to_vec(),
+			br#"{"streams":[]}"#.to_vec(),
+			b"invalid probe output".to_vec(),
+		] {
+			assert!(matches!(copy_expectation("mp4-h264", probe(bytes)), Err(ExportError::OutputValidation)));
+		}
+	}
+
+	#[test]
+	fn copy_planning_requires_known_mapped_audio_and_exact_output_expectations() {
+		for (format, video, audio, container) in [
+			("mp4-h264", "h264", None, "mov,mp4"),
+			("mp4-h264", "h264", Some("mp3"), "mov,mp4"),
+			("mov-h264", "h264", Some("aac"), "mov,mp4"),
+			("mp4-h265", "hevc", Some("aac"), "mov,mp4"),
+			("webm-vp9", "vp8", Some("vorbis"), "matroska,webm"),
+			("webm-vp9", "vp9", Some("opus"), "matroska,webm"),
+		] {
+			let expected = copy_expectation(
+				format,
+				Ok(ProcessOutput {
+					code: 0,
+					stdout: media(video, audio, container, 641, 359),
+				}),
+			)
+			.unwrap()
+			.expect("known compatible source must retain copy route");
+			assert!(expected
+				.validate(&media(video, audio, container, 641, 359))
+				.is_ok());
+			assert_eq!(
+				expected.validate(&media(video, audio, container, 640, 360)),
+				Err(ExportError::OutputValidation)
+			);
+			assert_eq!(
+				expected.validate(&media(video, Some("flac"), container, 641, 359)),
+				Err(ExportError::OutputValidation)
+			);
+			let mut extra: serde_json::Value =
+				serde_json::from_slice(&media(video, audio, container, 641, 359)).unwrap();
+			extra["streams"]
+				.as_array_mut()
+				.unwrap()
+				.push(serde_json::json!({"codec_type":"audio","codec_name":"vorbis"}));
+			assert_eq!(
+				expected.validate(&serde_json::to_vec(&extra).unwrap()),
+				Err(ExportError::OutputValidation)
+			);
+			if audio.is_some() {
+				assert_eq!(
+					expected.validate(&media(video, None, container, 641, 359)),
+					Err(ExportError::OutputValidation)
+				);
+			}
+		}
+		assert!(copy_expectation(
+			"mp4-h264",
+			Ok(ProcessOutput {
+				code: 0,
+				stdout: media("h264", Some("vorbis"), "mov,mp4", 64, 64),
+			})
+		)
+		.unwrap()
+		.is_none());
+	}
+
+	#[test]
 	fn copy_expectations_keep_mp3_vp8_and_silent_cases() {
 		for (format, video, audio, container) in [
 			("mp4-h264", "h264", Some("mp3"), "mov,mp4,m4a,3gp,3g2,mj2"),
@@ -2338,7 +2581,7 @@ mod tests {
 		] {
 			assert!(copy_compatible(format, video, audio));
 			assert!(
-				MediaExpectation::copied(format, Some((641, 359)), video, audio)
+				MediaExpectation::copied(format, (641, 359), video, audio)
 					.validate(&media(video, audio, container, 641, 359))
 					.is_ok()
 			);

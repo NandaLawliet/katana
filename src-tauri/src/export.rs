@@ -3,10 +3,31 @@
 // its transform, time-shifted to its start and overlaid (z-ordered by track)
 // onto a black canvas; audio is delayed and mixed. Progress streams back to the
 // UI. FFmpeg/ffprobe ship as bundled sidecars (see scripts/fetch-ffmpeg.ps1).
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(windows)]
+use std::{
+	ffi::OsStr,
+	os::windows::{
+		ffi::OsStrExt,
+		fs::OpenOptionsExt,
+		io::{AsRawHandle, FromRawHandle},
+	},
+};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
+#[cfg(windows)]
+use windows_sys::Win32::{
+	Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
+	Storage::FileSystem::{
+		FileDispositionInfo, FileIdInfo, FileRenameInfo, GetFileInformationByHandleEx,
+		ReOpenFile, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
+		FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+	},
+};
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +99,770 @@ pub struct ExportSettings {
 
 fn default_encoder() -> String {
 	"cpu".into()
+}
+
+/// Internal categories never contain driver messages, paths or stderr. The IPC
+/// boundary exposes only these fixed messages, including cleanup diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportError {
+	InvalidRequest,
+	Sidecar,
+	Spawn,
+	Event,
+	MissingTermination,
+	Process,
+	OutputPreparation,
+	OutputValidation,
+	Publication,
+}
+
+impl ExportError {
+	fn message(self) -> &'static str {
+		match self {
+			Self::InvalidRequest => "Invalid export request.",
+			Self::Sidecar => "Required bundled media tool is unavailable.",
+			Self::Spawn => "Could not start the media process.",
+			Self::Event => "Media process communication failed.",
+			Self::MissingTermination => "Media process did not report successful termination.",
+			Self::Process => "Media process failed. Export was not published.",
+			Self::OutputPreparation => "Could not prepare an isolated export output.",
+			Self::OutputValidation => "Export output failed media validation.",
+			Self::Publication => "Could not publish export. Existing destination was preserved.",
+		}
+	}
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NvencPreflight {
+	Ready,
+	NotReady,
+	Indeterminate(ExportError),
+}
+
+/// Nonzero exit is a completed probe, distinct from an infrastructure failure.
+#[derive(Debug, PartialEq, Eq)]
+struct ProcessOutput {
+	code: i32,
+	stdout: Vec<u8>,
+}
+
+fn classify_preflight(
+	nvenc: Result<ProcessOutput, ExportError>,
+	control: impl FnOnce() -> Result<ProcessOutput, ExportError>,
+) -> NvencPreflight {
+	match nvenc {
+		Ok(out) if out.code == 0 => NvencPreflight::Ready,
+		Ok(_) => match control() {
+			Ok(out) if out.code == 0 => NvencPreflight::NotReady,
+			Ok(_) => NvencPreflight::Indeterminate(ExportError::Process),
+			Err(e) => NvencPreflight::Indeterminate(e),
+		},
+		Err(e) => NvencPreflight::Indeterminate(e),
+	}
+}
+
+fn synthetic_probe_args(encoder: &str) -> Vec<String> {
+	let mut args: Vec<String> = [
+		"-nostdin",
+		"-f",
+		"lavfi",
+		"-i",
+		"color=c=black:s=64x64:r=30",
+		"-frames:v",
+		"3",
+		"-an",
+	]
+	.iter()
+	.map(|s| s.to_string())
+	.collect();
+	// Fixed internal choices; identical source, pixel format and null sink.
+	args.extend(h264_video_args(encoder, "medium").expect("fixed preflight encoder"));
+	args.extend(["-f", "null", "-"].iter().map(|s| s.to_string()));
+	args
+}
+
+/// Foundation only: deliberately not called by export selection/routing.
+/// Three frames bound the workload, not wall time. A hung driver can still hang
+/// this helper; timeout/kill/reap needs native qualification before M2 routing.
+#[allow(dead_code)]
+async fn nvenc_preflight(app: &AppHandle) -> NvencPreflight {
+	let nvenc = run_media(app, "ffmpeg", synthetic_probe_args("nvenc"), None).await;
+	if matches!(&nvenc, Ok(out) if out.code != 0) {
+		let control = run_media(app, "ffmpeg", synthetic_probe_args("cpu"), None).await;
+		classify_preflight(nvenc, || control)
+	} else {
+		classify_preflight(nvenc, || {
+			unreachable!("control only follows nonzero NVENC exit")
+		})
+	}
+}
+
+fn output_muxer(format: &str) -> &'static str {
+	match format {
+		"gif" => "gif",
+		"webm-vp9" => "webm",
+		"mov-h264" => "mov",
+		_ => "mp4", // public settings validated before preparing output
+	}
+}
+
+fn output_extension(format: &str) -> &'static str {
+	output_muxer(format)
+}
+
+static INVOCATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn invocation_token() -> String {
+	let stamp = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|d| d.as_nanos())
+		.unwrap_or(0);
+	format!(
+		"{}-{stamp}-{}",
+		std::process::id(),
+		INVOCATION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+	)
+}
+
+/// Canonical paths cover relative paths and symlinks. Native object identities
+/// also cover provable hard links. No claim of universal alias/race detection.
+fn reject_source_destination(destination: &Path, sources: &[&Path]) -> Result<(), ExportError> {
+	fn location(path: &Path) -> std::io::Result<PathBuf> {
+		std::fs::canonicalize(path).or_else(|_| {
+			let parent = path
+				.parent()
+				.filter(|p| !p.as_os_str().is_empty())
+				.unwrap_or(Path::new("."));
+			std::fs::canonicalize(parent).map(|p| p.join(path.file_name().unwrap_or_default()))
+		})
+	}
+	let dest = location(destination).map_err(|_| ExportError::OutputPreparation)?;
+	for source in sources {
+		if location(source).ok().as_ref() == Some(&dest) {
+			return Err(ExportError::InvalidRequest);
+		}
+		#[cfg(windows)]
+		if let (Ok(d), Ok(s)) = (
+			windows_regular_file_identity(destination),
+			windows_regular_file_identity(source),
+		) {
+			if d.is_some() && d == s {
+				return Err(ExportError::InvalidRequest);
+			}
+		}
+		#[cfg(unix)]
+		if let (Ok(d), Ok(s)) = (std::fs::metadata(destination), std::fs::metadata(source)) {
+			use std::os::unix::fs::MetadataExt;
+			if d.dev() == s.dev() && d.ino() == s.ino() {
+				return Err(ExportError::InvalidRequest);
+			}
+		}
+	}
+	Ok(())
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowsFileIdentity {
+	volume: u64,
+	file_id: [u8; 16],
+}
+
+#[cfg(windows)]
+fn windows_regular_file_identity(path: &Path) -> std::io::Result<Option<WindowsFileIdentity>> {
+	let file = std::fs::OpenOptions::new()
+		.read(true)
+		.access_mode(0)
+		.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+		.open(path)?;
+	if file.metadata()?.is_file() {
+		windows_file_identity(&file).map(Some)
+	} else {
+		Ok(None)
+	}
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &std::fs::File) -> std::io::Result<WindowsFileIdentity> {
+	let mut info = FILE_ID_INFO::default();
+	let ok = unsafe {
+		GetFileInformationByHandleEx(
+			file.as_raw_handle(),
+			FileIdInfo,
+			std::ptr::from_mut(&mut info).cast(),
+			std::mem::size_of::<FILE_ID_INFO>() as u32,
+		)
+	};
+	if ok == 0 {
+		Err(std::io::Error::last_os_error())
+	} else {
+		Ok(WindowsFileIdentity {
+			volume: info.VolumeSerialNumber,
+			file_id: info.FileId.Identifier,
+		})
+	}
+}
+
+#[cfg(windows)]
+fn reserve_windows_stage(path: &Path) -> std::io::Result<(std::fs::File, WindowsFileIdentity)> {
+	let file = std::fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create_new(true)
+		.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+		.open(path)?;
+	let identity = windows_file_identity(&file)?;
+	Ok((file, identity))
+}
+
+#[cfg(windows)]
+fn open_owned_windows_file(
+	path: &Path,
+	expected: WindowsFileIdentity,
+	access_mode: u32,
+	share_mode: u32,
+) -> std::io::Result<std::fs::File> {
+	let file = std::fs::OpenOptions::new()
+		.read(true)
+		.access_mode(access_mode)
+		.share_mode(share_mode)
+		.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+		.open(path)?;
+	if windows_file_identity(&file)? != expected {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::PermissionDenied,
+			"stage object identity changed",
+		));
+	}
+	Ok(file)
+}
+
+#[cfg(windows)]
+fn reopen_owned_windows_file(
+	guard: &std::fs::File,
+	expected: WindowsFileIdentity,
+	access_mode: u32,
+	share_mode: u32,
+) -> std::io::Result<std::fs::File> {
+	// ReOpenFile addresses the retained object, even after its name changes.
+	let handle = unsafe { ReOpenFile(guard.as_raw_handle(), access_mode, share_mode, 0) };
+	if handle == INVALID_HANDLE_VALUE {
+		return Err(std::io::Error::last_os_error());
+	}
+	let file = unsafe { std::fs::File::from_raw_handle(handle) };
+	if windows_file_identity(&file)? != expected {
+		return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+	}
+	Ok(file)
+}
+
+#[cfg(windows)]
+struct WindowsTextFile {
+	guard: Option<std::fs::File>,
+	path_guard: Option<std::fs::File>,
+	identity: WindowsFileIdentity,
+}
+
+#[cfg(windows)]
+impl WindowsTextFile {
+	fn cleanup(&mut self) -> bool {
+		if self.guard.is_none() {
+			let Some(pin) = self.path_guard.as_ref() else {
+				return false;
+			};
+			let Ok(guard) = reopen_owned_windows_file(
+				pin,
+				self.identity,
+				GENERIC_READ,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			) else {
+				return false;
+			};
+			self.guard = Some(guard);
+		}
+		// Release only pathname exclusion; object authority remains continuous.
+		drop(self.path_guard.take());
+		let Some(guard) = self.guard.as_ref() else {
+			return false;
+		};
+		let removed = reopen_owned_windows_file(
+			guard,
+			self.identity,
+			GENERIC_READ | DELETE,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		)
+		.and_then(|file| delete_windows_file(&file))
+		.is_ok();
+		if removed {
+			drop(self.guard.take());
+		}
+		removed
+	}
+}
+
+#[cfg(windows)]
+fn rename_windows_file(file: &std::fs::File, destination: &Path) -> std::io::Result<()> {
+	let name: Vec<u16> = OsStr::new(destination).encode_wide().collect();
+	let name_bytes = name
+		.len()
+		.checked_mul(std::mem::size_of::<u16>())
+		.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+	let buffer_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+		.checked_add(name_bytes)
+		.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+	let word = std::mem::size_of::<usize>();
+	let mut buffer = vec![0_usize; buffer_bytes.div_ceil(word)];
+	let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+	unsafe {
+		(*info).Anonymous.ReplaceIfExists = true;
+		(*info).RootDirectory = std::ptr::null_mut();
+		(*info).FileNameLength = name_bytes
+			.try_into()
+			.map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+		std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+		if SetFileInformationByHandle(
+			file.as_raw_handle(),
+			FileRenameInfo,
+			info.cast(),
+			buffer_bytes as u32,
+		) == 0
+		{
+			return Err(std::io::Error::last_os_error());
+		}
+	}
+	Ok(())
+}
+
+#[cfg(windows)]
+fn delete_windows_file(file: &std::fs::File) -> std::io::Result<()> {
+	let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+	let ok = unsafe {
+		SetFileInformationByHandle(
+			file.as_raw_handle(),
+			FileDispositionInfo,
+			std::ptr::from_ref(&disposition).cast(),
+			std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+		)
+	};
+	if ok == 0 {
+		Err(std::io::Error::last_os_error())
+	} else {
+		Ok(())
+	}
+}
+
+/// Only objects successfully reserved with create_new belong to this invocation.
+/// Windows pins the pathname while media tools use it, then retains the sealed
+/// object through handle-relative publication or cleanup without a pathname open.
+struct ExportFiles {
+	destination: PathBuf,
+	stage: PathBuf,
+	stage_owned: bool,
+	#[cfg(windows)]
+	stage_guard: Option<std::fs::File>,
+	#[cfg(windows)]
+	stage_path_guard: Option<std::fs::File>,
+	#[cfg(windows)]
+	stage_identity: WindowsFileIdentity,
+	#[cfg(windows)]
+	stage_sealed: bool,
+	#[cfg(windows)]
+	text: Vec<WindowsTextFile>,
+	#[cfg(not(windows))]
+	text: Vec<PathBuf>,
+}
+
+impl ExportFiles {
+	fn reserve(destination: &Path, format: &str, token: &str) -> Result<Self, ExportError> {
+		let parent = destination
+			.parent()
+			.filter(|p| !p.as_os_str().is_empty())
+			.unwrap_or(Path::new("."));
+		let parent = std::fs::canonicalize(parent).map_err(|_| ExportError::OutputPreparation)?;
+		let name = destination.file_name().ok_or(ExportError::InvalidRequest)?;
+		let destination = parent.join(name);
+		if std::fs::symlink_metadata(&destination).is_ok_and(|m| !m.file_type().is_file()) {
+			return Err(ExportError::OutputPreparation);
+		}
+		let stage = parent.join(format!(
+			".katana-stage-{token}.{}",
+			output_extension(format)
+		));
+		#[cfg(windows)]
+		let (stage_guard, stage_identity) =
+			reserve_windows_stage(&stage).map_err(|_| ExportError::OutputPreparation)?;
+		#[cfg(not(windows))]
+		std::fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&stage)
+			.map_err(|_| ExportError::OutputPreparation)?;
+		Ok(Self {
+			destination,
+			stage,
+			stage_owned: true,
+			#[cfg(windows)]
+			stage_guard: Some(stage_guard),
+			#[cfg(windows)]
+			stage_path_guard: None,
+			#[cfg(windows)]
+			stage_identity,
+			#[cfg(windows)]
+			stage_sealed: false,
+			text: Vec::new(),
+		})
+	}
+
+	fn reserve_text(
+		&mut self,
+		content: &str,
+		token: &str,
+		index: usize,
+	) -> Result<String, ExportError> {
+		let path = std::env::temp_dir().join(format!("katana-text-{token}-{index}.txt"));
+		#[cfg(windows)]
+		{
+			let file = std::fs::OpenOptions::new()
+				.read(true)
+				.write(true)
+				.create_new(true)
+				.share_mode(FILE_SHARE_READ)
+				.open(&path)
+				.map_err(|_| ExportError::OutputPreparation)?;
+			let identity = windows_file_identity(&file)
+				.map_err(|_| ExportError::OutputPreparation)?;
+			self.text.push(WindowsTextFile {
+				guard: None,
+				path_guard: Some(file),
+				identity,
+			});
+			let owned = self.text.last_mut().ok_or(ExportError::OutputPreparation)?;
+			owned.guard = Some(
+				reopen_owned_windows_file(
+					owned.path_guard.as_ref().ok_or(ExportError::OutputPreparation)?,
+					identity,
+					GENERIC_READ,
+					FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				).map_err(|_| ExportError::OutputPreparation)?,
+			);
+			let guard = self
+				.text
+				.last_mut()
+				.and_then(|owned| owned.path_guard.as_mut())
+				.ok_or(ExportError::OutputPreparation)?;
+			guard
+				.write_all(content.as_bytes())
+				.map_err(|_| ExportError::OutputPreparation)?;
+			guard.flush().map_err(|_| ExportError::OutputPreparation)?;
+			Ok(path.to_string_lossy().into_owned())
+		}
+		#[cfg(not(windows))]
+		{
+		let mut file = std::fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&path)
+			.map_err(|_| ExportError::OutputPreparation)?;
+		self.text.push(path.clone()); // own even if write fails
+		file.write_all(content.as_bytes())
+			.map_err(|_| ExportError::OutputPreparation)?;
+		Ok(path.to_string_lossy().into_owned())
+		}
+	}
+
+	#[cfg(windows)]
+	fn seal_stage(&mut self) -> std::io::Result<()> {
+		if self.stage_sealed {
+			let guard = self.stage_guard.as_ref().ok_or_else(|| {
+				std::io::Error::new(std::io::ErrorKind::PermissionDenied, "stage seal lost")
+			})?;
+			if windows_file_identity(guard)? != self.stage_identity {
+				return Err(std::io::Error::new(
+					std::io::ErrorKind::PermissionDenied,
+					"stage object identity changed",
+				));
+			}
+			return Ok(());
+		}
+		drop(self.stage_guard.take());
+		let path_guard = open_owned_windows_file(
+			&self.stage,
+			self.stage_identity,
+			GENERIC_READ,
+			FILE_SHARE_READ,
+		)?;
+		self.stage_path_guard = Some(path_guard);
+		self.stage_guard = Some(reopen_owned_windows_file(
+			self.stage_path_guard.as_ref().ok_or_else(|| {
+				std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+			})?,
+			self.stage_identity,
+			GENERIC_READ,
+			FILE_SHARE_READ | FILE_SHARE_DELETE,
+		)?);
+		self.stage_sealed = true;
+		Ok(())
+	}
+
+	fn validate_file(&mut self) -> Result<(), ExportError> {
+		#[cfg(windows)]
+		{
+			self.seal_stage()
+				.map_err(|_| ExportError::OutputValidation)?;
+			let guard = self
+				.stage_guard
+				.as_ref()
+				.ok_or(ExportError::OutputValidation)?;
+			if windows_file_identity(guard).map_err(|_| ExportError::OutputValidation)?
+				!= self.stage_identity
+			{
+				return Err(ExportError::OutputValidation);
+			}
+			let path_file = std::fs::OpenOptions::new()
+				.read(true)
+				.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+				.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+				.open(&self.stage)
+				.map_err(|_| ExportError::OutputValidation)?;
+			if windows_file_identity(&path_file).map_err(|_| ExportError::OutputValidation)?
+				!= self.stage_identity
+			{
+				return Err(ExportError::OutputValidation);
+			}
+			let metadata = guard
+				.metadata()
+				.map_err(|_| ExportError::OutputValidation)?;
+			if metadata.is_file() && metadata.len() > 0 {
+				Ok(())
+			} else {
+				Err(ExportError::OutputValidation)
+			}
+		}
+		#[cfg(not(windows))]
+		{
+			let metadata = std::fs::symlink_metadata(&self.stage)
+				.map_err(|_| ExportError::OutputValidation)?;
+			if metadata.file_type().is_file() && metadata.len() > 0 {
+				Ok(())
+			} else {
+				Err(ExportError::OutputValidation)
+			}
+		}
+	}
+
+	fn cleanup(&mut self) -> bool {
+		#[cfg(not(windows))]
+		fn remove(path: &Path) -> bool {
+			match std::fs::remove_file(path) {
+				Ok(()) => true,
+				Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+			}
+		}
+		#[cfg(windows)]
+		if self.stage_owned {
+			let removed = if self.stage_sealed {
+				drop(self.stage_path_guard.take());
+				if let Some(guard) = self.stage_guard.as_ref() {
+					reopen_owned_windows_file(
+						guard,
+						self.stage_identity,
+						GENERIC_READ | DELETE,
+						FILE_SHARE_READ | FILE_SHARE_DELETE,
+					)
+					.and_then(|file| delete_windows_file(&file))
+					.is_ok()
+				} else {
+					false
+				}
+			} else {
+				drop(self.stage_path_guard.take());
+				drop(self.stage_guard.take());
+				open_owned_windows_file(
+					&self.stage,
+					self.stage_identity,
+					GENERIC_READ | DELETE,
+					FILE_SHARE_READ | FILE_SHARE_WRITE,
+				)
+				.and_then(|file| delete_windows_file(&file))
+				.is_ok()
+			};
+			if removed {
+				drop(self.stage_guard.take());
+				self.stage_sealed = false;
+				self.stage_owned = false;
+			}
+		}
+		#[cfg(not(windows))]
+		if self.stage_owned && remove(&self.stage) {
+			self.stage_owned = false;
+		}
+		#[cfg(windows)]
+		self.text.retain_mut(|owned| !owned.cleanup());
+		#[cfg(not(windows))]
+		self.text.retain(|path| !remove(path));
+		self.stage_owned || !self.text.is_empty()
+	}
+
+	fn publish_stage(&mut self) -> std::io::Result<()> {
+		#[cfg(windows)]
+		{
+			self.seal_stage()?;
+			let guard = self.stage_guard.as_ref().ok_or_else(|| {
+				std::io::Error::new(std::io::ErrorKind::PermissionDenied, "stage seal lost")
+			})?;
+			drop(self.stage_path_guard.take());
+			let publication = reopen_owned_windows_file(
+				guard,
+				self.stage_identity,
+				GENERIC_READ | DELETE,
+				FILE_SHARE_READ | FILE_SHARE_DELETE,
+			)?;
+			rename_windows_file(&publication, &self.destination)?;
+			self.stage_owned = false;
+			self.stage_sealed = false;
+			drop(self.stage_guard.take());
+			Ok(())
+		}
+		#[cfg(not(windows))]
+		{
+			std::fs::rename(&self.stage, &self.destination)?;
+			self.stage_owned = false;
+			Ok(())
+		}
+	}
+
+	/// One rename boundary; never delete destination or use copy-overwrite.
+	/// Native Windows/locking/network filesystem behavior must be qualified.
+	fn finish(
+		&mut self,
+		process: Result<(), ExportError>,
+		validate: impl FnOnce() -> Result<(), ExportError>,
+		publish: impl FnOnce(&mut Self) -> std::io::Result<()>,
+		complete: impl FnOnce(),
+	) -> Result<(), ExportError> {
+		process?;
+		self.validate_file()?;
+		validate()?;
+		publish(self).map_err(|_| ExportError::Publication)?;
+		complete();
+		Ok(())
+	}
+}
+
+impl Drop for ExportFiles {
+	fn drop(&mut self) {
+		self.cleanup();
+	}
+}
+
+fn finish_cleanup(files: &mut ExportFiles, result: Result<(), ExportError>) -> Result<(), String> {
+	let cleanup_failed = files.cleanup();
+	match result {
+		Err(e) if cleanup_failed => Err(format!(
+			"{} Temporary file cleanup also failed.",
+			e.message()
+		)),
+		Err(e) => Err(e.message().into()),
+		Ok(()) => {
+			if cleanup_failed {
+				log::warn!("Export temporary file cleanup failed after publication.");
+			}
+			Ok(())
+		}
+	}
+}
+
+#[derive(Debug)]
+struct MediaExpectation {
+	format: String,
+	dimensions: (u32, u32),
+	video: String,
+	audio: Option<String>,
+}
+
+impl MediaExpectation {
+	fn composite(settings: &ExportSettings, aspect: &str, base: Option<(u32, u32)>) -> Self {
+		let (w, h) = canvas_dims(aspect, base);
+		let (w, h) = apply_resolution(w, h, &settings.resolution);
+		let (video, audio) = match settings.format.as_str() {
+			"gif" => ("gif", None),
+			"webm-vp9" => ("vp9", Some("opus")),
+			"mp4-h265" => ("hevc", Some("aac")),
+			_ => ("h264", Some("aac")),
+		};
+		Self {
+			format: settings.format.clone(),
+			dimensions: (w as u32, h as u32),
+			video: video.into(),
+			audio: audio.map(String::from),
+		}
+	}
+
+	fn copied(
+		format: &str,
+		dimensions: (u32, u32),
+		video: &str,
+		audio: Option<&str>,
+	) -> Self {
+		Self {
+			format: format.into(),
+			dimensions,
+			video: video.into(),
+			audio: audio.map(String::from),
+		}
+	}
+
+	fn validate(&self, bytes: &[u8]) -> Result<(), ExportError> {
+		let value: serde_json::Value =
+			serde_json::from_slice(bytes).map_err(|_| ExportError::OutputValidation)?;
+		let streams = value
+			.get("streams")
+			.and_then(|s| s.as_array())
+			.ok_or(ExportError::OutputValidation)?;
+		let container = value
+			.pointer("/format/format_name")
+			.and_then(|v| v.as_str())
+			.ok_or(ExportError::OutputValidation)?;
+		let expected = output_muxer(&self.format);
+		// ffprobe reports MOV/MP4 and Matroska/WebM as shared demuxer families.
+		if !container.split(',').any(|s| s == expected) {
+			return Err(ExportError::OutputValidation);
+		}
+		let video = streams
+			.iter()
+			.find(|v| v.get("codec_type").and_then(|v| v.as_str()) == Some("video"))
+			.ok_or(ExportError::OutputValidation)?;
+		let w = video.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
+		let h = video.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+		let packets = video
+			.get("nb_read_packets")
+			.and_then(|v| {
+				v.as_u64()
+					.or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+			})
+			.unwrap_or(0);
+		if w == 0
+			|| h == 0 || packets == 0
+			|| video.get("codec_name").and_then(|v| v.as_str()) != Some(self.video.as_str())
+		{
+			return Err(ExportError::OutputValidation);
+		}
+		let (ew, eh) = self.dimensions;
+		if w != ew as u64 || h != eh as u64 {
+			return Err(ExportError::OutputValidation);
+		}
+		let mut audio = streams.iter().filter(|s| {
+			s.get("codec_type").and_then(|v| v.as_str()) == Some("audio")
+		});
+		match (&self.audio, audio.next()) {
+			(None, None) => {},
+			(Some(codec), Some(stream))
+				if stream.get("codec_name").and_then(|v| v.as_str()) == Some(codec.as_str())
+					&& audio.next().is_none() => {},
+			_ => return Err(ExportError::OutputValidation),
+		}
+		Ok(())
+	}
 }
 
 /// Frames per second for GIF output.
@@ -168,14 +953,14 @@ fn validate_encoder(format: &str, encoder: &str) -> Result<(), String> {
 	match (format, encoder) {
 		(_, "cpu") | ("mp4-h264", "nvenc") => Ok(()),
 		(_, "nvenc") => Err("NVIDIA NVENC is only available for MP4 H.264 export.".into()),
-		(_, other) => Err(format!("Unsupported H.264 encoder: {other}")),
+		(_, _) => Err("Unsupported H.264 encoder.".into()),
 	}
 }
 
 fn validate_export_settings(settings: &ExportSettings) -> Result<(), String> {
 	match settings.format.as_str() {
 		"mp4-h264" | "mp4-h265" | "webm-vp9" | "mov-h264" | "gif" => {}
-		other => return Err(format!("Unsupported export format: {other}")),
+		_ => return Err("Unsupported export format.".into()),
 	}
 	validate_encoder(&settings.format, &settings.encoder)
 }
@@ -209,7 +994,7 @@ fn h264_video_args(encoder: &str, quality: &str) -> Result<Vec<String>, String> 
 			"-pix_fmt".into(),
 			"yuv420p".into(),
 		]),
-		other => Err(format!("Unsupported H.264 encoder: {other}")),
+		_ => Err("Unsupported H.264 encoder.".into()),
 	}
 }
 
@@ -602,7 +1387,7 @@ fn build_args(
 			"+faststart",
 		],
 		"mp4-h264" => Vec::new(),
-		_ => return Err(format!("Unsupported export format: {}", settings.format)),
+		_ => return Err("Unsupported export format.".into()),
 	};
 	if settings.format == "mp4-h264" {
 		args.extend(["-map", "[outv]", "-map", "[outa]"].iter().map(|s| s.to_string()));
@@ -617,27 +1402,83 @@ fn build_args(
 	}
 	// Machine-readable progress on stdout.
 	args.extend(["-progress", "pipe:1", "-nostats"].iter().map(|s| s.to_string()));
+	args.extend(["-f".into(), output_muxer(&settings.format).into()]);
 	args.push(output.to_string());
 	Ok((args, total))
 }
 
-/// Probe a single stream's codec name (e.g. "h264", "aac"); None if absent.
-async fn probe_codec(app: &AppHandle, path: &str, stream: &str) -> Option<String> {
-	let cmd = app.shell().sidecar("ffprobe").ok()?;
-	let args = [
-		"-v", "error", "-select_streams", stream, "-show_entries", "stream=codec_name", "-of",
-		"csv=p=0", path,
-	];
-	let out = cmd.args(args).output().await.ok()?;
-	if !out.status.success() {
-		return None;
+/// One successful structured probe defines every stream mapped by the copy path.
+/// Failed probes and missing video metadata are errors; no audio is a known absence.
+fn copy_expectation(
+	format: &str,
+	probe: Result<ProcessOutput, ExportError>,
+) -> Result<Option<MediaExpectation>, ExportError> {
+	let out = probe?;
+	if out.code != 0 {
+		return Err(ExportError::OutputValidation);
 	}
-	let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-	if s.is_empty() {
-		None
+	let value: serde_json::Value =
+		serde_json::from_slice(&out.stdout).map_err(|_| ExportError::OutputValidation)?;
+	let streams = value
+		.get("streams")
+		.and_then(|v| v.as_array())
+		.ok_or(ExportError::OutputValidation)?;
+	let video = streams
+		.iter()
+		.find(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("video"))
+		.ok_or(ExportError::OutputValidation)?;
+	let codec = |stream: &serde_json::Value| -> Result<String, ExportError> {
+		stream
+			.get("codec_name")
+			.and_then(|v| v.as_str())
+			.filter(|s| !s.is_empty())
+			.map(String::from)
+			.ok_or(ExportError::OutputValidation)
+	};
+	let vcodec = codec(video)?;
+	let dimension = |key| -> Result<u32, ExportError> {
+		video
+			.get(key)
+			.and_then(|v| v.as_u64())
+			.and_then(|v| u32::try_from(v).ok())
+			.filter(|v| *v > 0)
+			.ok_or(ExportError::OutputValidation)
+	};
+	let dimensions = (dimension("width")?, dimension("height")?);
+	let audio = streams
+		.iter()
+		.find(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("audio"));
+	let acodec = audio.map(codec).transpose()?;
+	if copy_compatible(format, &vcodec, acodec.as_deref()) {
+		Ok(Some(MediaExpectation::copied(
+			format,
+			dimensions,
+			&vcodec,
+			acodec.as_deref(),
+		)))
 	} else {
-		Some(s)
+		Ok(None)
 	}
+}
+
+async fn probe_copy_expectation(
+	app: &AppHandle,
+	path: &str,
+	format: &str,
+) -> Result<Option<MediaExpectation>, ExportError> {
+	let args = [
+		"-v",
+		"error",
+		"-show_entries",
+		"stream=codec_type,codec_name,width,height",
+		"-of",
+		"json",
+		path,
+	]
+	.iter()
+	.map(|s| s.to_string())
+	.collect();
+	copy_expectation(format, run_media(app, "ffprobe", args, None).await)
 }
 
 /// Structural eligibility for a lossless stream copy: a single, untouched,
@@ -707,6 +1548,7 @@ fn build_copy_args(c: &ExportClip, format: &str, output: &str) -> (Vec<String>, 
 		args.push("+faststart".into());
 	}
 	args.extend(["-progress", "pipe:1", "-nostats"].iter().map(|s| s.to_string()));
+	args.extend(["-f".into(), output_muxer(format).into()]);
 	args.push(output.to_string());
 	(args, span)
 }
@@ -726,27 +1568,45 @@ pub async fn export_video(
 	if clips.is_empty() {
 		return Err("Nothing to export: the timeline is empty.".into());
 	}
-	validate_export_settings(&settings)?;
+	validate_export_settings(&settings)
+		.map_err(|_| ExportError::InvalidRequest.message().to_string())?;
+	let destination = Path::new(&output);
+	let sources: Vec<&Path> = clips
+		.iter()
+		.filter(|c| !c.is_text())
+		.map(|c| Path::new(&c.path))
+		.collect();
+	reject_source_destination(destination, &sources).map_err(|e| e.message().to_string())?;
+	let token = invocation_token();
+	let mut files = ExportFiles::reserve(destination, &settings.format, &token)
+		.map_err(|e| e.message().to_string())?;
+	let stage = match files.stage.to_str().map(str::to_owned) {
+		Some(stage) => stage,
+		None => return finish_cleanup(&mut files, Err(ExportError::OutputPreparation)),
+	};
 
 	// Lossless stream-copy fastpath (single trimmed clip, compatible codecs).
 	if let Some(c) = copy_candidate(&clips, &aspect, &settings) {
-		let vcodec = probe_codec(&app, &c.path, "v:0").await;
-		let acodec = probe_codec(&app, &c.path, "a:0").await;
-		if let Some(vc) = vcodec.as_deref() {
-			if copy_compatible(&settings.format, vc, acodec.as_deref()) {
-				let (args, total) = build_copy_args(c, &settings.format, &output);
-				return run_ffmpeg(app, args, total).await;
-			}
+		match probe_copy_expectation(&app, &c.path, &settings.format).await {
+			Ok(Some(expected)) => {
+				let (args, total) = build_copy_args(c, &settings.format, &stage);
+				let result = run_export(&app, &mut files, args, total, &expected).await;
+				return finish_cleanup(&mut files, result);
+			},
+			Ok(None) => {}, // known incompatible streams use the existing composite route
+			Err(e) => return finish_cleanup(&mut files, Err(e)),
 		}
 	}
 
 	// Composite bottom-to-top: video clips only, lower track first, ties by start.
 	let mut order: Vec<usize> = (0..clips.len()).filter(|&i| clips[i].is_video()).collect();
 	order.sort_by(|&a, &b| {
-		clips[a]
-			.track
-			.cmp(&clips[b].track)
-			.then(clips[a].start.partial_cmp(&clips[b].start).unwrap_or(std::cmp::Ordering::Equal))
+		clips[a].track.cmp(&clips[b].track).then(
+			clips[a]
+				.start
+				.partial_cmp(&clips[b].start)
+				.unwrap_or(std::cmp::Ordering::Equal),
+		)
 	});
 
 	// Probe up front (async) so build_args stays pure. Text clips have no media.
@@ -766,31 +1626,24 @@ pub async fn export_video(
 
 	// Resolve text-overlay assets: the bundled font path + a temp file holding the
 	// raw text (so drawtext needs no escaping). Cleaned up after the run.
-	let stamp = SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.map(|d| d.as_nanos())
-		.unwrap_or(0);
-	let tmp = std::env::temp_dir();
 	let mut text_assets: Vec<Option<TextAsset>> = Vec::with_capacity(clips.len());
-	let mut text_tempfiles: Vec<std::path::PathBuf> = Vec::new();
 	for (i, c) in clips.iter().enumerate() {
 		let asset = match &c.text {
 			Some(t) => {
 				let fontfile = app
 					.path()
-					.resolve(format!("fonts/{}", t.font_file), tauri::path::BaseDirectory::Resource)
+					.resolve(
+						format!("fonts/{}", t.font_file),
+						tauri::path::BaseDirectory::Resource,
+					)
 					.ok()
 					.map(|p| p.to_string_lossy().to_string());
-				let txt_path = tmp.join(format!("katana-text-{stamp}-{i}.txt"));
-				let textfile = std::fs::write(&txt_path, &t.content)
-					.ok()
-					.map(|_| txt_path.to_string_lossy().to_string());
-				match (fontfile, textfile) {
-					(Some(ff), Some(tf)) => {
-						text_tempfiles.push(txt_path);
-						Some(TextAsset { textfile: tf, fontfile: ff })
-					}
-					_ => None,
+				match fontfile {
+					Some(fontfile) => match files.reserve_text(&t.content, &token, i) {
+						Ok(textfile) => Some(TextAsset { textfile, fontfile }),
+						Err(e) => return finish_cleanup(&mut files, Err(e)),
+					},
+					None => None, // retain existing missing-font behavior
 				}
 			}
 			None => None,
@@ -798,7 +1651,7 @@ pub async fn export_video(
 		text_assets.push(asset);
 	}
 
-	let (args, total) = build_args(
+	let built = build_args(
 		&clips,
 		&order,
 		&aspect,
@@ -807,19 +1660,1047 @@ pub async fn export_video(
 		base_dims,
 		&text_assets,
 		fps,
-		&output,
-	)?;
-
-	let result = run_ffmpeg(app, args, total).await;
-	for p in &text_tempfiles {
-		let _ = std::fs::remove_file(p);
-	}
-	result
+		&stage,
+	);
+	let (args, total) = match built {
+		Ok(plan) => plan,
+		Err(_) => return finish_cleanup(&mut files, Err(ExportError::InvalidRequest)),
+	};
+	let expected = MediaExpectation::composite(&settings, &aspect, base_dims);
+	let result = run_export(&app, &mut files, args, total, &expected).await;
+	finish_cleanup(&mut files, result)
 }
 
 #[cfg(test)]
 mod tests {
-	use super::{h264_video_args, nvenc_cq, validate_encoder, validate_export_settings, ExportSettings};
+	use super::*;
+
+	fn process(code: i32) -> Result<ProcessOutput, ExportError> {
+		Ok(ProcessOutput {
+			code,
+			stdout: Vec::new(),
+		})
+	}
+
+	struct Fixture(PathBuf);
+	impl Fixture {
+		fn new() -> Self {
+			let path = std::env::temp_dir().join(format!("katana-test-{}", invocation_token()));
+			std::fs::create_dir(&path).unwrap();
+			Self(path)
+		}
+		fn destination(&self) -> PathBuf {
+			self.0.join("destination.mp4")
+		}
+		fn files(&self) -> ExportFiles {
+			std::fs::write(self.destination(), b"sentinel").unwrap();
+			let files =
+				ExportFiles::reserve(&self.destination(), "mp4-h264", &invocation_token()).unwrap();
+			std::fs::write(&files.stage, b"candidate").unwrap();
+			files
+		}
+		fn sentinel(&self) {
+			assert_eq!(std::fs::read(self.destination()).unwrap(), b"sentinel");
+		}
+	}
+	impl Drop for Fixture {
+		fn drop(&mut self) {
+			std::fs::remove_dir_all(&self.0).unwrap();
+		}
+	}
+
+	fn settings(format: &str) -> ExportSettings {
+		ExportSettings {
+			format: format.into(),
+			resolution: "source".into(),
+			quality: "high".into(),
+			encoder: "cpu".into(),
+		}
+	}
+
+	fn clip() -> ExportClip {
+		ExportClip {
+			kind: "video".into(),
+			path: "source.mp4".into(),
+			in_point: 0.0,
+			out_point: 1.0,
+			speed: 1.0,
+			volume: 1.0,
+			muted: false,
+			fade_in: 0.0,
+			fade_out: 0.0,
+			start: 0.0,
+			track: 0,
+			x: 0.0,
+			y: 0.0,
+			scale: 1.0,
+			aspect_ratio: 16.0 / 9.0,
+			text: None,
+		}
+	}
+
+	fn media(video: &str, audio: Option<&str>, container: &str, w: u32, h: u32) -> Vec<u8> {
+		let mut streams = vec![
+			serde_json::json!({"codec_type":"video", "codec_name":video, "width":w, "height":h, "nb_read_packets":"1"}),
+		];
+		if let Some(audio) = audio {
+			streams.push(serde_json::json!({"codec_type":"audio", "codec_name":audio}));
+		}
+		serde_json::to_vec(
+			&serde_json::json!({"streams":streams, "format":{"format_name":container}}),
+		)
+		.unwrap()
+	}
+
+	#[test]
+	fn nvenc_zero_is_ready_without_control() {
+		assert_eq!(
+			classify_preflight(process(0), || panic!("unexpected control")),
+			NvencPreflight::Ready
+		);
+	}
+
+	#[test]
+	fn nvenc_nonzero_with_successful_control_is_not_ready() {
+		assert_eq!(
+			classify_preflight(process(7), || process(0)),
+			NvencPreflight::NotReady
+		);
+	}
+
+	#[test]
+	fn probe_infrastructure_and_control_failures_are_indeterminate() {
+		for error in [
+			ExportError::Sidecar,
+			ExportError::Spawn,
+			ExportError::Event,
+			ExportError::MissingTermination,
+		] {
+			assert_eq!(
+				classify_preflight(Err(error), || panic!("control after infrastructure error")),
+				NvencPreflight::Indeterminate(error)
+			);
+			assert_eq!(
+				classify_preflight(process(1), || Err(error)),
+				NvencPreflight::Indeterminate(error)
+			);
+		}
+		assert_eq!(
+			classify_preflight(process(1), || process(1)),
+			NvencPreflight::Indeterminate(ExportError::Process)
+		);
+	}
+
+	fn event_outcome(stderr: &str, code: i32) -> Result<ProcessOutput, ExportError> {
+		let mut events = ProcessEvents::default();
+		events.accept(&CommandEvent::Stderr(stderr.as_bytes().to_vec()), false);
+		events.accept(
+			&CommandEvent::Terminated(tauri_plugin_shell::process::TerminatedPayload {
+				code: Some(code),
+				signal: None,
+			}),
+			false,
+		);
+		events.finish()
+	}
+
+	#[test]
+	fn stderr_content_cannot_change_preflight_classification() {
+		for code in [0, 1, 9] {
+			let a = classify_preflight(event_outcome("NVENC driver failed", code), || process(0));
+			let b = classify_preflight(
+				event_outcome("input/filter/audio/credential/path", code),
+				|| process(0),
+			);
+			assert_eq!(a, b);
+		}
+	}
+
+	#[test]
+	fn event_error_and_missing_termination_never_succeed() {
+		assert_eq!(
+			ProcessEvents::default().finish(),
+			Err(ExportError::MissingTermination)
+		);
+		let mut events = ProcessEvents::default();
+		events.accept(
+			&CommandEvent::Error("raw sensitive exception".into()),
+			false,
+		);
+		events.accept(
+			&CommandEvent::Terminated(tauri_plugin_shell::process::TerminatedPayload {
+				code: Some(0),
+				signal: None,
+			}),
+			false,
+		);
+		assert_eq!(events.finish(), Err(ExportError::Event));
+		let mut events = ProcessEvents::default();
+		events.accept(
+			&CommandEvent::Terminated(tauri_plugin_shell::process::TerminatedPayload {
+				code: None,
+				signal: Some(9),
+			}),
+			false,
+		);
+		assert_eq!(events.finish(), Err(ExportError::MissingTermination));
+	}
+
+	#[test]
+	fn synthetic_probe_is_fixed_and_has_no_user_output_or_audio() {
+		let nvenc = synthetic_probe_args("nvenc");
+		let cpu = synthetic_probe_args("cpu");
+		for args in [&nvenc, &cpu] {
+			assert!(args
+				.windows(2)
+				.any(|p| p == ["-i", "color=c=black:s=64x64:r=30"]));
+			assert!(args.windows(2).any(|p| p == ["-frames:v", "3"]));
+			assert!(args.windows(2).any(|p| p == ["-pix_fmt", "yuv420p"]));
+			assert!(args.contains(&"-an".into()));
+			assert_eq!(&args[args.len() - 3..], ["-f", "null", "-"]);
+			assert!(!args.contains(&"-filter_complex".into()));
+		}
+	}
+
+	#[test]
+	fn all_actual_process_failures_are_terminal_and_preserve_destination() {
+		for stderr in [
+			"generic",
+			"invalid input",
+			"filter error",
+			"audio error",
+			"NVENC unavailable",
+		] {
+			let fixture = Fixture::new();
+			let mut files = fixture.files();
+			let calls = std::cell::Cell::new(0);
+			let process = tauri::async_runtime::block_on(encode_once(|| async {
+				calls.set(calls.get() + 1);
+				event_outcome(stderr, 1)
+			}));
+			assert_eq!(calls.get(), 1);
+			let result = files.finish(
+				process,
+				|| panic!("validation after failed process"),
+				|_| panic!("publication after failed process"),
+				|| panic!("completion after failure"),
+			);
+			assert_eq!(result, Err(ExportError::Process));
+			fixture.sentinel();
+		}
+	}
+
+	#[test]
+	fn validation_failure_preserves_destination_and_never_completes() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		assert_eq!(
+			files.finish(
+				Ok(()),
+				|| Err(ExportError::OutputValidation),
+				|_| panic!("publication before validation"),
+				|| panic!("completed failed validation")
+			),
+			Err(ExportError::OutputValidation)
+		);
+		fixture.sentinel();
+	}
+
+	#[test]
+	fn publication_failure_preserves_destination_and_never_completes() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		assert_eq!(
+			files.finish(
+				Ok(()),
+				|| Ok(()),
+				|_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+				|| panic!("completed failed publication")
+			),
+			Err(ExportError::Publication)
+		);
+		fixture.sentinel();
+	}
+
+	#[test]
+	fn exit_zero_missing_empty_or_nonregular_stage_is_not_success() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		std::fs::write(&files.stage, b"").unwrap();
+		assert_eq!(
+			files.finish(
+				Ok(()),
+				|| panic!("validate empty file"),
+				|_| panic!("publish empty"),
+				|| panic!()
+			),
+			Err(ExportError::OutputValidation)
+		);
+		#[cfg(windows)]
+		{
+			drop(files.stage_path_guard.take());
+			drop(files.stage_guard.take());
+		}
+		std::fs::remove_file(&files.stage).unwrap();
+		assert_eq!(files.validate_file(), Err(ExportError::OutputValidation));
+		std::fs::create_dir(&files.stage).unwrap();
+		assert_eq!(files.validate_file(), Err(ExportError::OutputValidation));
+		std::fs::remove_dir(&files.stage).unwrap();
+		fixture.sentinel();
+	}
+
+	#[test]
+	fn malformed_and_missing_required_media_structure_is_not_success() {
+		let expected = MediaExpectation::composite(&settings("mp4-h264"), "16:9", None);
+		for bytes in [b"not json".as_slice(), b"{}", b"{\"streams\":[]}"] {
+			assert_eq!(expected.validate(bytes), Err(ExportError::OutputValidation));
+		}
+		for bytes in [
+			media("h264", None, "mov,mp4", 1920, 1080),
+			media("hevc", Some("aac"), "mov,mp4", 1920, 1080),
+			media("h264", Some("aac"), "webm", 1920, 1080),
+			media("h264", Some("aac"), "mov,mp4", 0, 1080),
+			media("h264", Some("aac"), "mov,mp4", 1280, 720),
+		] {
+			assert_eq!(
+				expected.validate(&bytes),
+				Err(ExportError::OutputValidation)
+			);
+		}
+	}
+
+	#[test]
+	fn mp4_metadata_without_video_payload_is_not_success() {
+		let expected = MediaExpectation::composite(&settings("mp4-h264"), "16:9", None);
+		for packet_count in [
+			serde_json::Value::Null,
+			serde_json::json!("0"),
+			serde_json::json!(0),
+		] {
+			let bytes = serde_json::to_vec(&serde_json::json!({
+				"streams": [
+					{"codec_type":"video", "codec_name":"h264", "width":1920, "height":1080, "nb_read_packets":packet_count},
+					{"codec_type":"audio", "codec_name":"aac"}
+				],
+				"format":{"format_name":"mov,mp4"}
+			}))
+			.unwrap();
+			assert_eq!(
+				expected.validate(&bytes),
+				Err(ExportError::OutputValidation)
+			);
+		}
+	}
+
+	#[test]
+	fn reservation_collision_never_claims_or_removes_foreign_stage() {
+		let fixture = Fixture::new();
+		let files = ExportFiles::reserve(&fixture.destination(), "mp4-h264", "collision").unwrap();
+		std::fs::write(&files.stage, b"foreign").unwrap();
+		assert!(ExportFiles::reserve(&fixture.destination(), "mp4-h264", "collision").is_err());
+		assert_eq!(std::fs::read(&files.stage).unwrap(), b"foreign");
+	}
+
+	#[test]
+	fn cleanup_only_removes_invocation_owned_files() {
+		let fixture = Fixture::new();
+		let mut first = fixture.files();
+		let second =
+			ExportFiles::reserve(&fixture.destination(), "mp4-h264", &invocation_token()).unwrap();
+		assert_ne!(first.stage, second.stage);
+		let text = first.reserve_text("text", &invocation_token(), 0).unwrap();
+		let foreign = fixture.0.join("foreign.txt");
+		std::fs::write(&foreign, b"foreign").unwrap();
+		assert!(!first.cleanup());
+		assert!(!first.stage.exists());
+		assert!(!Path::new(&text).exists());
+		assert!(second.stage.exists());
+		std::fs::write(&first.stage, b"new owner after cleanup").unwrap();
+		assert!(!first.cleanup());
+		assert_eq!(
+			std::fs::read(&first.stage).unwrap(),
+			b"new owner after cleanup"
+		);
+		assert!(foreign.exists());
+		fixture.sentinel();
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_stage_guard_blocks_replacement_during_encode_and_validation() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let displaced = fixture.0.join("displaced.mp4");
+
+		assert!(std::fs::rename(&files.stage, &displaced).is_err());
+		assert_eq!(std::fs::read(&files.stage).unwrap(), b"candidate");
+		assert!(files.validate_file().is_ok());
+		assert!(!files.cleanup());
+		assert!(!files.stage.exists());
+		assert!(!displaced.exists());
+		fixture.sentinel();
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_stage_seal_blocks_mutation_after_validation_until_publication() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let stage = files.stage.clone();
+
+		files
+			.finish(
+				Ok(()),
+				|| {
+					assert!(std::fs::OpenOptions::new()
+						.write(true)
+						.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+						.open(&stage)
+						.is_err());
+					Ok(())
+				},
+				ExportFiles::publish_stage,
+				|| {},
+			)
+			.unwrap();
+
+		assert_eq!(std::fs::read(fixture.destination()).unwrap(), b"candidate");
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_already_open_stage_writer_fails_seal_and_preserves_destination() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let writer = std::fs::OpenOptions::new()
+			.write(true)
+			.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+			.open(&files.stage)
+			.unwrap();
+
+		assert_eq!(
+			files.finish(
+				Ok(()),
+				|| panic!("validation with an open writer"),
+				|_| panic!("publication with an open writer"),
+				|| panic!("completion with an open writer"),
+			),
+			Err(ExportError::OutputValidation)
+		);
+		fixture.sentinel();
+		drop(writer);
+		assert!(!files.cleanup());
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_foreign_stage_replacement_is_not_published_or_cleaned() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let owned = fixture.0.join("owned-but-displaced.mp4");
+
+		assert!(files.validate_file().is_ok());
+		drop(files.stage_path_guard.take());
+		drop(files.stage_guard.take());
+		std::fs::rename(&files.stage, &owned).unwrap();
+		std::fs::write(&files.stage, b"foreign replacement").unwrap();
+
+		assert!(files.publish_stage().is_err());
+		fixture.sentinel();
+		assert!(files.cleanup());
+		assert_eq!(std::fs::read(&files.stage).unwrap(), b"foreign replacement");
+		assert_eq!(std::fs::read(&owned).unwrap(), b"candidate");
+	}
+
+	#[test]
+	fn cleanup_failure_preserves_primary_sanitized_error() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		#[cfg(windows)]
+		drop(files.stage_guard.take());
+		std::fs::remove_file(&files.stage).unwrap();
+		std::fs::create_dir(&files.stage).unwrap();
+		let message = finish_cleanup(&mut files, Err(ExportError::Process)).unwrap_err();
+		assert!(message.starts_with(ExportError::Process.message()));
+		assert!(message.contains("cleanup also failed"));
+		assert!(!message.contains(fixture.0.to_str().unwrap()));
+		std::fs::remove_dir(&files.stage).unwrap();
+	}
+
+	#[test]
+	fn destination_source_identity_is_rejected_before_process() {
+		let fixture = Fixture::new();
+		assert_eq!(
+			reject_source_destination(&fixture.destination(), &[&fixture.destination()]),
+			Err(ExportError::InvalidRequest)
+		);
+		std::fs::write(fixture.destination(), b"source").unwrap();
+		assert_eq!(
+			reject_source_destination(&fixture.destination(), &[&fixture.destination()]),
+			Err(ExportError::InvalidRequest)
+		);
+		assert!(reject_source_destination(
+			&fixture.0.join("different.mp4"),
+			&[&fixture.destination()]
+		)
+		.is_ok());
+	}
+
+	#[test]
+	fn text_collision_never_claims_foreign_file_and_stage_extension_matches_format() {
+		let fixture = Fixture::new();
+		for format in ["mp4-h264", "mp4-h265", "mov-h264", "webm-vp9", "gif"] {
+			let files = ExportFiles::reserve(&fixture.destination(), format, &invocation_token()).unwrap();
+			assert_eq!(files.stage.extension().unwrap(), output_extension(format));
+			assert_eq!(files.stage.parent(), files.destination.parent());
+		}
+		let mut owner = fixture.files();
+		let token = invocation_token();
+		let path = owner.reserve_text("foreign", &token, 0).unwrap();
+		let mut other = ExportFiles::reserve(&fixture.destination(), "mp4-h264", &invocation_token()).unwrap();
+		assert!(other.reserve_text("overwrite", &token, 0).is_err());
+		assert!(!other.cleanup());
+		assert_eq!(std::fs::read(&path).unwrap(), b"foreign");
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_text_guard_allows_reader_and_cleanup_deletes_owned_object() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let path = files
+			.reserve_text("reader-visible", &invocation_token(), 0)
+			.unwrap();
+
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), "reader-visible");
+		assert!(!files.cleanup());
+		assert!(!Path::new(&path).exists());
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_text_displacement_cannot_redirect_cleanup_to_foreign_replacement() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let path = PathBuf::from(
+			files
+				.reserve_text("owned", &invocation_token(), 0)
+				.unwrap(),
+		);
+		let displaced = fixture.0.join("owned-text-displaced.txt");
+		assert!(std::fs::rename(&path, &displaced).is_err());
+		// The cleanup transition releases pathname exclusion, but not the object.
+		drop(files.text[0].path_guard.take());
+		std::fs::rename(&path, &displaced).unwrap();
+		std::fs::write(&path, b"foreign replacement").unwrap();
+
+		assert!(!files.cleanup());
+		assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
+		assert!(!displaced.exists());
+		assert!(!files.cleanup());
+		assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_sealed_stage_failed_delete_retains_authority_for_retry_and_drop() {
+		for retry in [true, false] {
+			let fixture = Fixture::new();
+			let mut files = fixture.files();
+			files.validate_file().unwrap();
+			let reader = std::fs::OpenOptions::new()
+				.read(true)
+				.share_mode(FILE_SHARE_READ)
+				.open(&files.stage)
+				.unwrap();
+			let error = finish_cleanup(&mut files, Err(ExportError::Process)).unwrap_err();
+			assert_eq!(
+				error,
+				"Media process failed. Export was not published. Temporary file cleanup also failed."
+			);
+			assert!(files.stage_owned && files.stage_sealed);
+			assert!(files.stage_guard.is_some());
+			assert!(files.stage_path_guard.is_none());
+			drop(reader);
+			let stage = files.stage.clone();
+			let displaced = fixture.0.join("owned-after-denied-delete.mp4");
+			std::fs::rename(&stage, &displaced).unwrap();
+			std::fs::write(&stage, b"foreign replacement").unwrap();
+			if retry {
+				assert!(!files.cleanup());
+				assert!(!files.stage_owned && !files.stage_sealed);
+				assert!(files.stage_guard.is_none());
+				assert!(!files.cleanup());
+			}
+			drop(files);
+			assert!(!displaced.exists());
+			assert_eq!(std::fs::read(&stage).unwrap(), b"foreign replacement");
+			fixture.sentinel();
+		}
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_regular_file_aliases_are_rejected_without_touching_source() {
+		let fixture = Fixture::new();
+		let source = fixture.0.join("source.mp4");
+		let alias = fixture.0.join("alias.mp4");
+		let distinct = fixture.0.join("distinct.mp4");
+		std::fs::write(&source, b"source sentinel").unwrap();
+		std::fs::hard_link(&source, &alias).unwrap();
+		std::fs::write(&distinct, b"source sentinel").unwrap();
+		assert_eq!(
+			windows_regular_file_identity(&source).unwrap(),
+			windows_regular_file_identity(&alias).unwrap()
+		);
+		assert_ne!(
+			windows_regular_file_identity(&source).unwrap(),
+			windows_regular_file_identity(&distinct).unwrap()
+		);
+		assert_eq!(
+			reject_source_destination(&alias, &[&source]),
+			Err(ExportError::InvalidRequest)
+		);
+		assert_eq!(reject_source_destination(&distinct, &[&source]), Ok(()));
+		assert_eq!(
+			reject_source_destination(&fixture.0.join("missing.mp4"), &[&source]),
+			Ok(())
+		);
+		assert_eq!(std::fs::read(&source).unwrap(), b"source sentinel");
+		assert_eq!(std::fs::read(&alias).unwrap(), b"source sentinel");
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_text_failed_cleanup_retains_authority_for_retry() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let path = PathBuf::from(files.reserve_text("owned", &invocation_token(), 0).unwrap());
+		let reader = std::fs::OpenOptions::new().read(true)
+			.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(&path).unwrap();
+		assert!(files.cleanup());
+		assert!(files.text[0].guard.is_some());
+		assert!(files.text[0].path_guard.is_none());
+		drop(reader);
+		let displaced = fixture.0.join("owned-after-failed-cleanup.txt");
+		std::fs::rename(&path, &displaced).unwrap();
+		std::fs::write(&path, b"foreign replacement").unwrap();
+		assert!(!files.cleanup());
+		assert!(!displaced.exists());
+		assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
+		std::fs::remove_file(&path).unwrap();
+		fixture.sentinel();
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_stage_publication_keeps_sealed_object_after_path_release() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let stage = files.stage.clone();
+		let displaced = fixture.0.join("validated-owned.mp4");
+		let complete = std::cell::Cell::new(false);
+		files.finish(
+			Ok(()), || Ok(()),
+			|files| {
+				// Exercise displacement at publication's unpin/reopen boundary.
+				drop(files.stage_path_guard.take());
+				std::fs::rename(&stage, &displaced)?;
+				std::fs::write(&stage, b"foreign replacement")?;
+				assert!(std::fs::OpenOptions::new().write(true)
+					.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+					.open(&displaced).is_err());
+				files.publish_stage()
+			}, || complete.set(true),
+		).unwrap();
+		assert!(complete.get());
+		assert_eq!(std::fs::read(fixture.destination()).unwrap(), b"candidate");
+		assert_eq!(std::fs::read(&stage).unwrap(), b"foreign replacement");
+		assert!(!displaced.exists());
+		assert!(!files.cleanup());
+		assert_eq!(std::fs::read(&stage).unwrap(), b"foreign replacement");
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_sealed_stage_cleanup_keeps_object_after_path_release() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let displaced = fixture.0.join("owned-stage-displaced.mp4");
+		files.validate_file().unwrap();
+		drop(files.stage_path_guard.take());
+		std::fs::rename(&files.stage, &displaced).unwrap();
+		std::fs::write(&files.stage, b"foreign replacement").unwrap();
+		assert!(!files.cleanup());
+		assert!(!displaced.exists());
+		assert_eq!(std::fs::read(&files.stage).unwrap(), b"foreign replacement");
+		fixture.sentinel();
+	}
+
+	#[cfg(windows)]
+	fn native_tool(name: &str) -> PathBuf {
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries")
+			.join(format!("{name}-x86_64-pc-windows-msvc.exe"))
+	}
+
+	#[cfg(windows)]
+	fn native_probe(path: &Path) -> std::process::Output {
+		std::process::Command::new(native_tool("ffprobe"))
+			.args(["-v", "error", "-count_packets", "-show_entries",
+				"stream=codec_type,codec_name,width,height,nb_read_packets:format=format_name",
+				"-of", "json"])
+			.arg(path).output().expect("qualification ffprobe")
+	}
+
+	#[cfg(windows)]
+	#[test]
+	#[ignore = "requires locally provisioned FFmpeg/ffprobe sidecars"]
+	fn windows_native_stage_substitution_cannot_validate_foreign_media() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files(); // invalid owned bytes
+		let foreign = fixture.0.join("foreign-valid.mp4");
+		let out = std::process::Command::new(native_tool("ffmpeg"))
+			.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi",
+				"-i", "color=c=black:s=64x64:r=30", "-frames:v", "3", "-an",
+				"-c:v", "libx264", "-pix_fmt", "yuv420p"])
+			.arg(&foreign).output().unwrap();
+		assert!(out.status.success(), "fixture encoding failed");
+		let foreign_bytes = std::fs::read(&foreign).unwrap();
+		let probe = native_probe(&foreign);
+		assert!(probe.status.success());
+		let expected = copy_expectation("mp4-h264", Ok(ProcessOutput {
+			code: probe.status.code().unwrap(), stdout: probe.stdout.clone(),
+		})).unwrap().expect("native silent H.264 source retains stream copy");
+		expected.validate(&probe.stdout).unwrap();
+		files.validate_file().unwrap();
+		let displaced = fixture.0.join("owned-displaced.mp4");
+		// Deterministic boundary before ffprobe, matching the residual R1 schedule.
+		assert!(std::fs::rename(&files.stage, &displaced).is_err());
+		assert!(std::fs::rename(&foreign, &files.stage).is_err());
+		assert!(std::fs::rename(&fixture.0, fixture.0.with_extension("displaced")).is_err());
+		assert!(std::fs::OpenOptions::new().write(true)
+			.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+			.open(&files.stage).is_err());
+		let probe = native_probe(&files.stage);
+		assert!(!probe.status.success());
+		let complete = std::cell::Cell::new(false);
+		assert_eq!(files.finish(Ok(()), || expected.validate(&probe.stdout),
+			ExportFiles::publish_stage, || complete.set(true)), Err(ExportError::OutputValidation));
+		assert!(!complete.get());
+		fixture.sentinel();
+		assert_eq!(std::fs::read(&foreign).unwrap(), foreign_bytes);
+		assert!(!files.cleanup());
+		assert!(!files.stage.exists());
+		// Actual FFmpeg writes the reserved path; actual ffprobe reads under the seal.
+		let mut valid = fixture.files();
+		let encoded = std::process::Command::new(native_tool("ffmpeg"))
+			.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "lavfi",
+				"-i", "color=c=black:s=64x64:r=30", "-frames:v", "3", "-an",
+				"-c:v", "libx264", "-pix_fmt", "yuv420p"])
+			.arg(&valid.stage).output().unwrap();
+		assert!(encoded.status.success(), "owned encoding failed");
+		valid.validate_file().unwrap();
+		let probe = native_probe(&valid.stage);
+		assert!(probe.status.success(), "sealed ffprobe access failed");
+		let validated_bytes = std::fs::read(&valid.stage).unwrap();
+		valid.finish(Ok(()), || expected.validate(&probe.stdout),
+			ExportFiles::publish_stage, || complete.set(true)).unwrap();
+		assert!(complete.get());
+		assert_eq!(std::fs::read(fixture.destination()).unwrap(), validated_bytes);
+		assert_eq!(std::fs::read(&foreign).unwrap(), foreign_bytes);
+	}
+
+	#[cfg(windows)]
+	#[test]
+	#[ignore = "requires locally provisioned FFmpeg sidecar and qualification font"]
+	fn windows_native_text_access_and_displaced_owned_cleanup() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let token = invocation_token();
+		let path = PathBuf::from(files.reserve_text("native text", &token, 0).unwrap());
+		assert!(files.reserve_text("overwrite", &token, 0).is_err());
+		let displaced = fixture.0.join("owned-text.txt");
+		assert!(std::fs::rename(&path, &displaced).is_err());
+		std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("../static/fonts/qualification-only.ttf"), fixture.0.join("font.ttf")).unwrap();
+		let escaped = path.to_string_lossy().replace('\\', "/").replace(':', "\\:");
+		let filter = format!("drawtext=fontfile='font.ttf':textfile='{escaped}':fontsize=12:fontcolor=white");
+		let out = std::process::Command::new(native_tool("ffmpeg")).current_dir(&fixture.0)
+			.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi",
+				"-i", "color=c=black:s=64x64:r=30", "-vf", &filter,
+				"-frames:v", "1", "-f", "null", "-"]).output().unwrap();
+		assert!(out.status.success(), "native text access failed");
+		assert_eq!(std::fs::read(&path).unwrap(), b"native text");
+		// Displace at cleanup's unpin/reopen boundary without relinquishing authority.
+		drop(files.text[0].path_guard.take());
+		std::fs::rename(&path, &displaced).unwrap();
+		std::fs::write(&path, b"foreign replacement").unwrap();
+		assert!(!files.cleanup());
+		assert!(!displaced.exists());
+		assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
+		std::fs::remove_file(&path).unwrap(); // fixture-owned substitute only
+		fixture.sentinel();
+	}
+
+	#[test]
+	fn actual_encode_infrastructure_errors_do_not_retry() {
+		for error in [ExportError::Sidecar, ExportError::Spawn, ExportError::Event, ExportError::MissingTermination] {
+			let calls = std::cell::Cell::new(0);
+			let result = tauri::async_runtime::block_on(encode_once(|| async {
+				calls.set(calls.get() + 1);
+				Err(error)
+			}));
+			assert_eq!(result, Err(error));
+			assert_eq!(calls.get(), 1);
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn provable_symlink_and_hardlink_aliases_are_rejected() {
+		let fixture = Fixture::new();
+		let source = fixture.0.join("source.mp4");
+		std::fs::write(&source, b"source").unwrap();
+		let hard = fixture.0.join("hard.mp4");
+		std::fs::hard_link(&source, &hard).unwrap();
+		let sym = fixture.0.join("sym.mp4");
+		std::os::unix::fs::symlink(&source, &sym).unwrap();
+		for dest in [hard, sym] {
+			assert_eq!(
+				reject_source_destination(&dest, &[&source]),
+				Err(ExportError::InvalidRequest)
+			);
+		}
+	}
+
+	#[test]
+	fn copy_planning_rejects_unknown_dimensions_and_audio_before_export() {
+		let probe = |bytes| {
+			Ok(ProcessOutput {
+				code: 0,
+				stdout: bytes,
+			})
+		};
+		let clips = vec![clip()];
+		assert!(copy_candidate(&clips, "original", &settings("mp4-h264")).is_some());
+		for error in [
+			ExportError::Sidecar,
+			ExportError::Spawn,
+			ExportError::Event,
+			ExportError::MissingTermination,
+		] {
+			assert!(matches!(copy_expectation("mp4-h264", Err(error)), Err(e) if e == error));
+		}
+		assert!(matches!(
+			copy_expectation(
+				"mp4-h264",
+				Ok(ProcessOutput {
+					code: 1,
+					stdout: Vec::new()
+				})
+			),
+			Err(ExportError::OutputValidation)
+		));
+		for bytes in [
+			br#"{"streams":[{"codec_type":"video","codec_name":"h264","height":64}]}"#.to_vec(),
+			br#"{"streams":[{"codec_type":"video","codec_name":"h264","width":64,"height":64},{"codec_type":"audio"}]}"#.to_vec(),
+			br#"{"streams":[{"codec_type":"video","codec_name":"h264","width":0,"height":64}]}"#.to_vec(),
+			br#"{"streams":[]}"#.to_vec(),
+			b"invalid probe output".to_vec(),
+		] {
+			assert!(matches!(copy_expectation("mp4-h264", probe(bytes)), Err(ExportError::OutputValidation)));
+		}
+	}
+
+	#[test]
+	fn copy_planning_requires_known_mapped_audio_and_exact_output_expectations() {
+		for (format, video, audio, container) in [
+			("mp4-h264", "h264", None, "mov,mp4"),
+			("mp4-h264", "h264", Some("mp3"), "mov,mp4"),
+			("mov-h264", "h264", Some("aac"), "mov,mp4"),
+			("mp4-h265", "hevc", Some("aac"), "mov,mp4"),
+			("webm-vp9", "vp8", Some("vorbis"), "matroska,webm"),
+			("webm-vp9", "vp9", Some("opus"), "matroska,webm"),
+		] {
+			let expected = copy_expectation(
+				format,
+				Ok(ProcessOutput {
+					code: 0,
+					stdout: media(video, audio, container, 641, 359),
+				}),
+			)
+			.unwrap()
+			.expect("known compatible source must retain copy route");
+			assert!(expected
+				.validate(&media(video, audio, container, 641, 359))
+				.is_ok());
+			assert_eq!(
+				expected.validate(&media(video, audio, container, 640, 360)),
+				Err(ExportError::OutputValidation)
+			);
+			assert_eq!(
+				expected.validate(&media(video, Some("flac"), container, 641, 359)),
+				Err(ExportError::OutputValidation)
+			);
+			let mut extra: serde_json::Value =
+				serde_json::from_slice(&media(video, audio, container, 641, 359)).unwrap();
+			extra["streams"]
+				.as_array_mut()
+				.unwrap()
+				.push(serde_json::json!({"codec_type":"audio","codec_name":"vorbis"}));
+			assert_eq!(
+				expected.validate(&serde_json::to_vec(&extra).unwrap()),
+				Err(ExportError::OutputValidation)
+			);
+			if audio.is_some() {
+				assert_eq!(
+					expected.validate(&media(video, None, container, 641, 359)),
+					Err(ExportError::OutputValidation)
+				);
+			}
+		}
+		assert!(copy_expectation(
+			"mp4-h264",
+			Ok(ProcessOutput {
+				code: 0,
+				stdout: media("h264", Some("vorbis"), "mov,mp4", 64, 64),
+			})
+		)
+		.unwrap()
+		.is_none());
+	}
+
+	#[test]
+	fn copy_expectations_keep_mp3_vp8_and_silent_cases() {
+		for (format, video, audio, container) in [
+			("mp4-h264", "h264", Some("mp3"), "mov,mp4,m4a,3gp,3g2,mj2"),
+			("mov-h264", "h264", Some("aac"), "mov,mp4,m4a,3gp,3g2,mj2"),
+			("mp4-h265", "hevc", None, "mov,mp4,m4a,3gp,3g2,mj2"),
+			("webm-vp9", "vp8", Some("vorbis"), "matroska,webm"),
+			("webm-vp9", "vp9", None, "matroska,webm"),
+		] {
+			assert!(copy_compatible(format, video, audio));
+			assert!(
+				MediaExpectation::copied(format, (641, 359), video, audio)
+					.validate(&media(video, audio, container, 641, 359))
+					.is_ok()
+			);
+		}
+	}
+
+	#[test]
+	fn composite_expectations_keep_all_formats_audio_and_dimensions() {
+		for (format, video, audio, container) in [
+			("mp4-h264", "h264", Some("aac"), "mov,mp4"),
+			("mp4-h265", "hevc", Some("aac"), "mov,mp4"),
+			("mov-h264", "h264", Some("aac"), "mov,mp4"),
+			("webm-vp9", "vp9", Some("opus"), "matroska,webm"),
+			("gif", "gif", None, "gif"),
+		] {
+			assert!(MediaExpectation::composite(&settings(format), "16:9", None)
+				.validate(&media(video, audio, container, 1920, 1080))
+				.is_ok());
+		}
+	}
+
+	#[test]
+	fn copy_and_composite_write_explicit_muxer_and_keep_selection() {
+		for format in ["mp4-h264", "mp4-h265", "mov-h264", "webm-vp9", "gif"] {
+			let clips = vec![clip()];
+			let settings = settings(format);
+			let (args, _) = build_args(
+				&clips,
+				&[0],
+				"original",
+				&settings,
+				&[false],
+				Some((640, 360)),
+				&[None],
+				30.0,
+				"stage",
+			)
+			.unwrap();
+			assert_eq!(
+				&args[args.len() - 3..],
+				["-f", output_muxer(format), "stage"]
+			);
+			if format != "gif" {
+				assert!(copy_candidate(&clips, "original", &settings).is_some());
+				let (args, _) = build_copy_args(&clips[0], format, "stage");
+				assert!(args.windows(2).any(|p| p == ["-c", "copy"]));
+				assert_eq!(
+					&args[args.len() - 3..],
+					["-f", output_muxer(format), "stage"]
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn encoding_progress_cannot_report_completion() {
+		for seconds in [-1.0, 0.0, 1.0, 10.0, f64::INFINITY, f64::NAN] {
+			assert!(encoding_progress(seconds, 1.0) < 1.0);
+		}
+	}
+
+	#[test]
+	fn publication_follows_validation_and_completion_follows_rename() {
+		use std::cell::Cell;
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		let phase = Cell::new(0);
+		files
+			.finish(
+				Ok(()),
+				|| {
+					fixture.sentinel();
+					phase.set(1);
+					Ok(())
+				},
+				|files| {
+					assert_eq!(phase.get(), 1);
+					fixture.sentinel();
+					assert_eq!(std::fs::read(&files.stage).unwrap(), b"candidate");
+					assert_eq!(
+						files.destination,
+						std::fs::canonicalize(&fixture.0)
+							.unwrap()
+							.join("destination.mp4")
+					);
+					files.publish_stage()?;
+					phase.set(2);
+					Ok(())
+				},
+				|| {
+					assert_eq!(phase.get(), 2);
+					assert_eq!(std::fs::read(fixture.destination()).unwrap(), b"candidate");
+					phase.set(3);
+				},
+			)
+			.unwrap();
+		assert_eq!(phase.get(), 3);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn native_same_directory_rename_replaces_only_after_validation() {
+		let fixture = Fixture::new();
+		let mut files = fixture.files();
+		files
+			.finish(
+				Ok(()),
+				|| {
+					fixture.sentinel();
+					Ok(())
+				},
+				ExportFiles::publish_stage,
+				|| {
+					assert_eq!(std::fs::read(fixture.destination()).unwrap(), b"candidate");
+				},
+			)
+			.unwrap();
+		assert!(!files.stage.exists());
+	}
 
 	#[test]
 	fn nvenc_quality_mapping_is_distinct() {
@@ -863,49 +2744,124 @@ mod tests {
 	}
 }
 
-/// Spawn the bundled ffmpeg sidecar with the given args and stream progress.
-async fn run_ffmpeg(app: AppHandle, args: Vec<String>, total: f64) -> Result<(), String> {
-	let cmd = app
-		.shell()
-		.sidecar("ffmpeg")
-		.map_err(|e| format!("Bundled ffmpeg not found: {e}"))?;
-	let (mut rx, _child) = cmd
-		.args(args)
-		.spawn()
-		.map_err(|e| format!("Could not start ffmpeg: {e}"))?;
+/// Minimal event seam shared by actual export, ffprobe and synthetic probes.
+/// Error and missing terminal events always win over an apparent exit zero.
+#[derive(Default)]
+struct ProcessEvents {
+	code: Option<i32>,
+	error: Option<ExportError>,
+	stdout: Vec<u8>,
+}
 
-	let mut stderr_tail: Vec<String> = Vec::new();
-	let mut exit_ok = false;
-	while let Some(event) = rx.recv().await {
+impl ProcessEvents {
+	fn accept(&mut self, event: &CommandEvent, capture: bool) {
 		match event {
-			CommandEvent::Stdout(bytes) => {
-				let line = String::from_utf8_lossy(&bytes);
-				parse_progress(&app, &line, total);
+			CommandEvent::Error(_) => self.error = Some(ExportError::Event),
+			CommandEvent::Terminated(payload) => {
+				if payload.code.is_none() || self.code.is_some() {
+					self.error = Some(ExportError::MissingTermination);
+				}
+				self.code = payload.code;
 			}
-			CommandEvent::Stderr(bytes) => {
-				let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
-				if !line.is_empty() {
-					stderr_tail.push(line);
-					if stderr_tail.len() > 50 {
-						stderr_tail.remove(0);
-					}
+			CommandEvent::Stdout(bytes) if capture => {
+				// JSON output is bounded; overflow is an event failure, not success.
+				if self.stdout.len() + bytes.len() + 1 <= 1024 * 1024 {
+					self.stdout.extend(bytes);
+					self.stdout.push(b'\n');
+				} else {
+					self.error = Some(ExportError::Event);
 				}
 			}
-			CommandEvent::Terminated(payload) => {
-				exit_ok = payload.code == Some(0);
-			}
-			_ => {}
+			_ => {} // stderr is discarded, never classified or exposed
 		}
 	}
 
-	if exit_ok {
-		let _ = app.emit("export:progress", 1.0_f64);
-		Ok(())
-	} else {
-		let tail: Vec<String> = stderr_tail.iter().rev().take(6).cloned().collect();
-		let msg = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-		Err(format!("ffmpeg failed:\n{msg}"))
+	fn finish(self) -> Result<ProcessOutput, ExportError> {
+		if let Some(e) = self.error {
+			return Err(e);
+		}
+		Ok(ProcessOutput {
+			code: self.code.ok_or(ExportError::MissingTermination)?,
+			stdout: self.stdout,
+		})
 	}
+}
+
+async fn run_media(
+	app: &AppHandle,
+	tool: &str,
+	args: Vec<String>,
+	total: Option<f64>,
+) -> Result<ProcessOutput, ExportError> {
+	let cmd = app
+		.shell()
+		.sidecar(tool)
+		.map_err(|_| ExportError::Sidecar)?;
+	let (mut rx, _child) = cmd.args(args).spawn().map_err(|_| ExportError::Spawn)?;
+	let mut events = ProcessEvents::default();
+	while let Some(event) = rx.recv().await {
+		if let (Some(total), CommandEvent::Stdout(bytes)) = (total, &event) {
+			parse_progress(app, &String::from_utf8_lossy(bytes), total);
+		}
+		events.accept(&event, tool == "ffprobe");
+	}
+	events.finish()
+}
+
+fn successful_process(outcome: Result<ProcessOutput, ExportError>) -> Result<(), ExportError> {
+	match outcome {
+		Ok(out) if out.code == 0 => Ok(()),
+		Ok(_) => Err(ExportError::Process),
+		Err(e) => Err(e),
+	}
+}
+
+/// FnOnce is the local runner seam: actual encoding has one invocation and no
+/// retry contract. Synthetic control probes use their separate foundation path.
+async fn encode_once<F>(run: impl FnOnce() -> F) -> Result<(), ExportError>
+where
+	F: std::future::Future<Output = Result<ProcessOutput, ExportError>>,
+{
+	successful_process(run().await)
+}
+
+/// Actual export has exactly one process attempt. Preflight is not consulted,
+/// and no failure (including NVENC-like stderr) can trigger a CPU retry.
+async fn run_export(
+	app: &AppHandle,
+	files: &mut ExportFiles,
+	args: Vec<String>,
+	total: f64,
+	expected: &MediaExpectation,
+) -> Result<(), ExportError> {
+	let process = encode_once(|| run_media(app, "ffmpeg", args, Some(total))).await;
+	process?;
+	files.validate_file()?;
+	let args: Vec<String> = [
+		"-v",
+		"error",
+		"-count_packets",
+		"-show_entries",
+		"stream=codec_type,codec_name,width,height,nb_read_packets:format=format_name",
+		"-of",
+		"json",
+	]
+	.iter()
+	.map(|s| s.to_string())
+	.chain(std::iter::once(files.stage.to_string_lossy().into_owned()))
+	.collect();
+	let probe = run_media(app, "ffprobe", args, None).await?;
+	if probe.code != 0 {
+		return Err(ExportError::OutputValidation);
+	}
+	files.finish(
+		Ok(()),
+		|| expected.validate(&probe.stdout),
+		ExportFiles::publish_stage,
+		|| {
+			let _ = app.emit("export:progress", 1.0_f64);
+		},
+	)
 }
 
 /// Parse a `-progress` stdout line and emit a 0..1 fraction.
@@ -924,6 +2880,15 @@ fn parse_progress(app: &AppHandle, line: &str, total: f64) {
 }
 
 fn emit_progress(app: &AppHandle, seconds: f64, total: f64) {
-	let pct = if total > 0.0 { (seconds / total).clamp(0.0, 1.0) } else { 0.0 };
+	let pct = encoding_progress(seconds, total);
 	let _ = app.emit("export:progress", pct);
+}
+
+/// Reserve completion for the validated publication boundary.
+fn encoding_progress(seconds: f64, total: f64) -> f64 {
+	if seconds.is_finite() && total.is_finite() && total > 0.0 {
+		(seconds / total).clamp(0.0, 0.999)
+	} else {
+		0.0
+	}
 }
